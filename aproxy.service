@@ -1,0 +1,15 @@
+[Unit]
+Description=Anthropic-compatible reverse proxy for Ollama (auth + audit)
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/home/sergey/Projects/aproxy/.env
+ExecStart=/opt/litellm-venv/bin/python3 /home/sergey/Projects/aproxy/proxy.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
