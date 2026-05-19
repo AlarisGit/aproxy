@@ -122,8 +122,8 @@ cd aproxy
 2. Создать Python-виртуальное окружение и установить зависимости:
 
 ```bash
-python3 -m venv /opt/litellm-venv
-/opt/litellm-venv/bin/pip install fastapi uvicorn httpx
+python3 -m venv .venv
+.venv/bin/pip install fastapi uvicorn httpx
 ```
 
 3. Создать конфигурационные файлы из примеров:
@@ -139,18 +139,7 @@ PROXY_LOG=/var/log/aproxy/proxy.log
 EOF
 
 # keys.json (секрет — не коммитировать)
-# Генерируем первый токен и добавляем в файл
-ADMIN_TOKEN="sk-$(openssl rand -base64 24 | tr -d '/+=' | head -c 32)"
-python3 -c "
-import json
-keys = {
-    '$ADMIN_TOKEN': 'admin',
-}
-with open('keys.json', 'w') as f:
-    json.dump(keys, f, indent=2)
-print(f'Created keys.json with admin token: {list(keys.keys())[0][:8]}...')
-"
-chmod 600 keys.json
+.venv/bin/python3 proxy.py keys add admin
 ```
 
 4. Создать директорию для логов:
@@ -223,41 +212,50 @@ systemctl --user restart aproxy
 
 ### Управление токенами
 
-Файл `keys.json` — JSON-маппинг токенов в имена пользователей:
+Файл `keys.json` хранит хэши токенов вместо plaintext. Формат:
 
 ```json
 {
-  "sk-XXXXXXXXXXXXXXXXXXXXXXXXXXXX": "sergey",
-  "sk-YYYYYYYYYYYYYYYYYYYYYYYYYYYY": "hermes"
+  "_salt": "3b74d84067abb2a7...64_hex_chars",
+  "users": {
+    "sha256$e9818110c5a1fa72...64_hex_chars": "sergey",
+    "sha256$781490daf155e3b4...64_hex_chars": "hermes"
+  }
 }
 ```
 
-**Правила:**
-- Токен — произвольная строка. Рекомендуется префикс `sk-` и длина 32+ символов.
-- Имя пользователя используется в логах и аудите (ключ маскируется до первых 8 символов + `...`).
-- Нет bypass-токенов. Каждый токен должен быть явно прописан в `keys.json`.
-- После изменения файла — перезапустить сервис (токены загружаются при старте).
+Хранится `SHA-256(salt + token)` — восстановить оригинальный токен из хэша невозможно.
+Случайный salt генерируется при первом добавлении ключа или миграции.
 
-**Генерация нового токена:**
+**CLI-команды** (управление ключами через `proxy.py keys`):
 
 ```bash
-# Сгенерировать случайный токен
-echo "sk-$(openssl rand -base64 24 | tr -d '/+=' | head -c 32)"
+# Добавить пользователя (токен генерируется автоматически)
+.venv/bin/python3 proxy.py keys add <имя_пользователя>
 
-# Добавить в keys.json
-python3 -c "
-import json
-with open('keys.json') as f:
-    keys = json.load(f)
-keys['sk-НОВЫЙ_ТОКЕН'] = 'имя_пользователя'
-with open('keys.json', 'w') as f:
-    json.dump(keys, f, indent=2)
-"
-chmod 600 keys.json
+# Добавить пользователя с конкретным токеном
+.venv/bin/python3 proxy.py keys add <имя_пользователя> sk-мой_токен
 
-# Перезапустить
-systemctl --user restart aproxy
+# Мигрировать plaintext keys.json → хэшированный формат
+.venv/bin/python3 proxy.py keys migrate
+
+# Список пользователей (видны только хэши)
+.venv/bin/python3 proxy.py keys list
+
+# Удалить пользователя
+.venv/bin/python3 proxy.py keys remove <имя_пользователя>
 ```
+
+**Обратная совместимость:** если `keys.json` в старом формате (`{"sk-xxx": "user"}`), прокси
+продолжит работать. Команда `keys add` автоматически мигрирует файл при первом добавлении.
+Ручная миграция через `keys migrate` заменяет plaintext значения на хэши — **сохраните
+резервную копию токенов перед миграцией, восстановить из хэша невозможно.**
+
+**Правила:**
+- Токен — произвольная строка. Рекомендуется префикс `sk-` и длина 32+ символов.
+- Имя пользователя используется в логах и аудите.
+- Нет bypass-токенов. Каждый токен должен быть явно прописан в `keys.json`.
+- После изменения файла — перезапустить сервис (токены загружаются при старте).
 
 ### Запуск и управление сервисом
 
@@ -378,6 +376,8 @@ tail /var/log/aproxy/audit.jsonl
    ```bash
    chmod 600 keys.json .env
    ```
+   Начиная с v1.4, `keys.json` хранит не сами токены, а их SHA-256 хэши с salt —
+   даже при утечке файла восстановить токены невозможно.
 
 2. **Порт 4001 не должен быть открыт в интернет.** Если используется UFW:
    ```bash

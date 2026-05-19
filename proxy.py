@@ -1,4 +1,4 @@
-#!/opt/litellm-venv/bin/python3
+#!/usr/bin/env python3
 """
 aproxy — Anthropic-compatible reverse proxy for Ollama.
 Provides token authentication and usage audit while passing
@@ -18,9 +18,12 @@ When both are present, x-api-key takes priority for user identification.
 All tokens are validated against keys.json -- no bypass or fallback.
 """
 
+import hashlib
 import json
 import logging
 import os
+import secrets
+import sys
 import time
 from datetime import datetime, timezone
 
@@ -33,14 +36,62 @@ from fastapi.responses import StreamingResponse, JSONResponse
 OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 PORT = int(os.environ.get("ANTHROPIC_PROXY_PORT", "4001"))
 
-# Static key file: maps token VALUES to user names
-# Supports both x-api-key and Authorization: Bearer tokens
-# Format: {"sk-xxx": "sergey", "sk-yyy": "hermes", ...}
-API_KEYS = {}
+# --- Key store ---
+# Supports two formats in keys.json:
+#   Legacy (plaintext):  {"sk-xxx": "user1", "sk-yyy": "user2"}
+#   Hashed:             {"_salt": "hex...", "users": {"sha256$hex...": "user1", ...}}
+# Hashed format stores SHA-256(salt + token) so plaintext tokens never touch disk.
+# The validate_key function tries both formats for backward compatibility.
+
 _keys_file = os.environ.get("API_KEYS_FILE", "/home/sergey/Projects/aproxy/keys.json")
-if os.path.exists(_keys_file):
+SALT_LEN = 32  # bytes
+
+
+def _hash_token(salt: str, token: str) -> str:
+    """Compute SHA-256(salt_hex + token)."""
+    return hashlib.sha256((salt + token).encode()).hexdigest()
+
+
+def _load_keys() -> tuple[dict, dict, str | None]:
+    """Load key file. Returns (plain_keys, hashed_users, salt).
+    plain_keys:  {token: username} for legacy format
+    hashed_users: {hash_hex: username} for hashed format
+    salt: hex string for hashed format (None for legacy-only files)
+    """
+    if not os.path.exists(_keys_file):
+        return {}, {}, None
     with open(_keys_file) as f:
-        API_KEYS = json.load(f)
+        data = json.load(f)
+
+    # Legacy format: flat dict of token -> username
+    if "_salt" not in data:
+        return data, {}, None
+
+    salt = data["_salt"]
+    users = {k: v for k, v in data["users"].items() if k.startswith("sha256$")}
+    return {}, users, salt
+
+
+API_KEYS, _HASHED_USERS, _SALT = _load_keys()
+
+
+def validate_key(api_key: str | None) -> str:
+    """Validate authentication token. Returns username.
+    Tries legacy plaintext lookup first, then hashed lookup."""
+    if not api_key:
+        raise HTTPException(status_code=401, detail={"type": "authentication_error", "message": "Authentication required. Set ANTHROPIC_AUTH_TOKEN or provide a valid key."})
+
+    # Legacy: direct token lookup
+    if api_key in API_KEYS:
+        return API_KEYS[api_key]
+
+    # Hashed: compute SHA-256(salt + token) and look up
+    if _SALT:
+        token_hash = "sha256$" + _hash_token(_SALT, api_key)
+        if token_hash in _HASHED_USERS:
+            return _HASHED_USERS[token_hash]
+
+    raise HTTPException(status_code=401, detail={"type": "authentication_error", "message": "Invalid authentication token. Check your ANTHROPIC_AUTH_TOKEN or key value."})
 
 # Audit log
 AUDIT_LOG = os.environ.get("AUDIT_LOG", "/var/log/aproxy/audit.jsonl")
@@ -117,16 +168,9 @@ def extract_api_key(x_api_key: str | None, authorization: str | None) -> str | N
     return None
 
 
-async def validate_key(api_key: str | None) -> str:
-    """Validate authentication token. Returns user identifier. Raises HTTPException with Anthropic format."""
-    if not api_key:
-        raise HTTPException(status_code=401, detail={"type": "authentication_error", "message": "Authentication required. Set ANTHROPIC_AUTH_TOKEN or provide a valid key."})
-
-    # Check if token maps to a user in keys.json
-    if api_key in API_KEYS:
-        return API_KEYS[api_key]
-
-    raise HTTPException(status_code=401, detail={"type": "authentication_error", "message": "Invalid authentication token. Check your ANTHROPIC_AUTH_TOKEN or key value."})
+async def validate_key_async(api_key: str | None) -> str:
+    """Async wrapper for validate_key (FastAPI endpoints expect async)."""
+    return validate_key(api_key)
 
 
 @app.middleware("http")
@@ -171,13 +215,13 @@ async def health():
         ollama_version = r.json().get("version", "unknown") if r.status_code == 200 else "unreachable"
     except Exception:
         ollama_version = "unreachable"
-    return {"status": "ok", "ollama": {"version": ollama_version}, "proxy": "aproxy/1.3"}
+    return {"status": "ok", "ollama": {"version": ollama_version}, "proxy": "aproxy/1.4"}
 
 
 @app.get("/v1/models")
 async def list_models(x_api_key: str | None = Header(None), authorization: str | None = Header(None)):
     api_key = extract_api_key(x_api_key, authorization)
-    user = await validate_key(api_key)
+    user = await validate_key_async(api_key)
     audit(user, "GET", "/v1/models")
 
     try:
@@ -193,7 +237,7 @@ async def messages(request: Request, x_api_key: str | None = Header(None),
                    authorization: str | None = Header(None)):
     """Main Anthropic Messages API endpoint - proxied to Ollama."""
     api_key = extract_api_key(x_api_key, authorization)
-    user = await validate_key(api_key)
+    user = await validate_key_async(api_key)
 
     body = await request.body()
     body_json = json.loads(body) if body else {}
@@ -287,7 +331,7 @@ async def messages_batches(request: Request, x_api_key: str | None = Header(None
                             authorization: str | None = Header(None)):
     """Message batches - return not supported."""
     api_key = extract_api_key(x_api_key, authorization)
-    await validate_key(api_key)
+    await validate_key_async(api_key)
     return make_error(404, "not_found", "Message batches are not supported by this proxy")
 
 
@@ -297,7 +341,7 @@ async def messages_batches(request: Request, x_api_key: str | None = Header(None
 async def organizations(request: Request, x_api_key: str | None = Header(None),
                          authorization: str | None = Header(None)):
     api_key = extract_api_key(x_api_key, authorization)
-    user = await validate_key(api_key)
+    user = await validate_key_async(api_key)
     audit(user, "GET", "/v1/organizations")
     return {"data": [], "has_more": False}
 
@@ -306,7 +350,7 @@ async def organizations(request: Request, x_api_key: str | None = Header(None),
 async def org_users(org_id: str, x_api_key: str | None = Header(None),
                     authorization: str | None = Header(None)):
     api_key = extract_api_key(x_api_key, authorization)
-    user = await validate_key(api_key)
+    user = await validate_key_async(api_key)
     audit(user, "GET", f"/v1/organizations/{org_id}/users")
     return {"data": [], "has_more": False}
 
@@ -319,7 +363,7 @@ async def catch_all(request: Request, path: str, x_api_key: str | None = Header(
                      authorization: str | None = Header(None)):
     """Proxy any unmatched paths to Ollama with authentication."""
     api_key = extract_api_key(x_api_key, authorization)
-    user = await validate_key(api_key)
+    user = await validate_key_async(api_key)
     audit(user, request.method, f"/{path}")
 
     # Build headers for Ollama
@@ -338,5 +382,112 @@ async def catch_all(request: Request, path: str, x_api_key: str | None = Header(
 
 
 if __name__ == "__main__":
-    log.info(f"Starting aproxy on :{PORT} -> {OLLAMA_BASE}")
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    if len(sys.argv) > 1 and sys.argv[1] == "keys":
+        # --- CLI key management ---
+        _cmd = sys.argv[2] if len(sys.argv) > 2 else ""
+
+        def _read_keyfile():
+            if os.path.exists(_keys_file):
+                with open(_keys_file) as f:
+                    return json.load(f)
+            return {}
+
+        def _write_keyfile(data):
+            with open(_keys_file, "w") as f:
+                json.dump(data, f, indent=2)
+            os.chmod(_keys_file, 0o600)
+
+        if _cmd == "add":
+            if len(sys.argv) < 4:
+                print("Usage: proxy.py keys add <username> [token]")
+                print("  If token is omitted, a random one is generated.")
+                sys.exit(1)
+            username = sys.argv[3]
+            token = sys.argv[4] if len(sys.argv) > 4 else f"sk-{secrets.token_urlsafe(32)}"
+            data = _read_keyfile()
+
+            # If file is in legacy format, migrate first
+            if "_salt" not in data:
+                salt = secrets.token_hex(SALT_LEN)
+                new_users = {}
+                for plain_token, user in data.items():
+                    new_users["sha256$" + _hash_token(salt, plain_token)] = user
+                data = {"_salt": salt, "users": new_users}
+
+            data["users"]["sha256$" + _hash_token(data["_salt"], token)] = username
+            _write_keyfile(data)
+            print(f"Added user '{username}' with token '{token}'")
+            print(f"Token hash: sha256${_hash_token(data['_salt'], token)[:16]}...")
+            print("Restart aproxy to reload keys.")
+
+        elif _cmd == "migrate":
+            data = _read_keyfile()
+            if "_salt" in data:
+                print("keys.json is already in hashed format. Nothing to do.")
+                sys.exit(0)
+            if not data:
+                print("keys.json is empty. Nothing to migrate.")
+                sys.exit(0)
+            salt = secrets.token_hex(SALT_LEN)
+            new_users = {}
+            for plain_token, user in data.items():
+                h = "sha256$" + _hash_token(salt, plain_token)
+                new_users[h] = user
+            new_data = {"_salt": salt, "users": new_users}
+            _write_keyfile(new_data)
+            print(f"Migrated {len(new_users)} token(s) to hashed format.")
+            print("Plaintext tokens have been replaced with SHA-256 hashes.")
+            print("Keep a backup of the old tokens if needed — they cannot be recovered from hashes.")
+            print("Restart aproxy to reload keys.")
+
+        elif _cmd == "list":
+            data = _read_keyfile()
+            if "_salt" in data:
+                print("Format: hashed (SHA-256 with salt)")
+                print(f"Salt: {data['_salt'][:16]}...")
+                for h, user in data.get("users", {}).items():
+                    print(f"  {h[:24]}...  ->  {user}")
+            else:
+                print("Format: legacy (plaintext tokens)")
+                for token, user in data.items():
+                    print(f"  {token[:8]}...  ->  {user}")
+            print(f"Total: {len(data.get('users', data))} key(s)")
+
+        elif _cmd == "remove":
+            if len(sys.argv) < 4:
+                print("Usage: proxy.py keys remove <username>")
+                sys.exit(1)
+            username = sys.argv[3]
+            data = _read_keyfile()
+            if "_salt" in data:
+                to_remove = [h for h, u in data["users"].items() if u == username]
+                if not to_remove:
+                    print(f"User '{username}' not found.")
+                    sys.exit(1)
+                for h in to_remove:
+                    del data["users"][h]
+                _write_keyfile(data)
+                print(f"Removed {len(to_remove)} key(s) for user '{username}'.")
+            else:
+                to_remove = [t for t, u in data.items() if u == username]
+                if not to_remove:
+                    print(f"User '{username}' not found.")
+                    sys.exit(1)
+                for t in to_remove:
+                    del data[t]
+                _write_keyfile(data)
+                print(f"Removed {len(to_remove)} key(s) for user '{username}'.")
+            print("Restart aproxy to reload keys.")
+
+        else:
+            print("Usage: proxy.py keys <command> [args]")
+            print()
+            print("Commands:")
+            print("  add <username> [token]   Add a user (generate token if omitted)")
+            print("  migrate                  Convert plaintext keys.json to hashed format")
+            print("  list                     List known keys (hashes only)")
+            print("  remove <username>        Remove a user's keys")
+            sys.exit(1)
+    else:
+        log.info(f"Starting aproxy on :{PORT} -> {OLLAMA_BASE}")
+        uvicorn.run(app, host="0.0.0.0", port=PORT)
