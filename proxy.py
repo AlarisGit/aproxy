@@ -30,7 +30,8 @@ from datetime import datetime, timezone
 import httpx
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 
 # --- Configuration ---
 OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
@@ -112,8 +113,35 @@ if PROXY_LOG:
     _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     log.addHandler(_fh)
 
+# --- Metrics (Prometheus) ---
+REQUEST_COUNT = Counter(
+    "aproxy_requests_total",
+    "Total proxied requests",
+    ["user", "method", "path", "status_code"],
+)
+REQUEST_LATENCY = Histogram(
+    "aproxy_request_duration_seconds",
+    "Request latency in seconds",
+    ["user", "method", "path"],
+    buckets=(0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0),
+)
+TOKENS_IN = Counter(
+    "aproxy_tokens_input_total",
+    "Total input tokens proxied",
+    ["user", "model"],
+)
+TOKENS_OUT = Counter(
+    "aproxy_tokens_output_total",
+    "Total output tokens proxied",
+    ["user", "model"],
+)
+ACTIVE_CONNECTIONS = Gauge(
+    "aproxy_active_connections",
+    "Currently active proxied connections",
+)
+
 # --- App ---
-app = FastAPI(title="aproxy")
+app = FastAPI(title="aproxy", docs_url=None, redoc_url=None, openapi_url=None)
 client = httpx.AsyncClient(base_url=OLLAMA_BASE, timeout=httpx.Timeout(300.0))
 
 
@@ -127,7 +155,14 @@ def make_error(status_code: int, error_type: str, message: str) -> JSONResponse:
 
 def audit(user_key: str, method: str, path: str, model: str | None = None,
           status: int | None = None, tokens: dict | None = None, error: str | None = None):
-    """Write audit record."""
+    """Write audit record and update Prometheus metrics."""
+    if tokens and model:
+        inp = tokens.get("input_tokens", 0)
+        out = tokens.get("output_tokens", 0)
+        if inp:
+            TOKENS_IN.labels(user=user_key, model=model).inc(inp)
+        if out:
+            TOKENS_OUT.labels(user=user_key, model=model).inc(out)
     if not AUDIT_ENABLED:
         return
     record = {
@@ -168,21 +203,99 @@ def extract_api_key(x_api_key: str | None, authorization: str | None) -> str | N
     return None
 
 
-async def validate_key_async(api_key: str | None) -> str:
-    """Async wrapper for validate_key (FastAPI endpoints expect async)."""
-    return validate_key(api_key)
+async def validate_key_async(api_key: str | None, request: Request | None = None) -> str:
+    """Validate token and store user in request.state for metrics."""
+    user = validate_key(api_key)
+    if request is not None:
+        request.state.user = user
+    return user
 
 
 @app.middleware("http")
 async def add_cors_and_timing(request: Request, call_next):
+    # Paths that are skipped from proxied-request metrics
+    _SKIP_METRICS = {"/health", "/metrics"}
+    path = request.url.path
+
+    if path in _SKIP_METRICS:
+        start = time.time()
+        response = await call_next(request)
+        elapsed = time.time() - start
+        response.headers["X-Response-Time"] = f"{elapsed:.3f}s"
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        return response
+
     start = time.time()
-    response = await call_next(request)
+    ACTIVE_CONNECTIONS.inc()
+    try:
+        response = await call_next(request)
+    except Exception:
+        ACTIVE_CONNECTIONS.dec()
+        raise
     elapsed = time.time() - start
+
+    # Detect SSE by content-type header. Starlette's internal _StreamingResponse
+    # may have media_type=None; the real type is only in response headers.
+    ct = response.headers.get("content-type", "")
+    is_streaming = ct.startswith("text/event-stream")
+
+    if is_streaming:
+        # For SSE, metrics and gauge are managed by the stream generator:
+        # wrap the body iterator so that ACTIVE_CONNECTIONS is decremented
+        # only after the client finishes consuming the stream, and request
+        # metrics (count, latency) are recorded at that point too.
+        #
+        # Use upstream status code from request.state.stream_status (set by
+        # _stream_response) rather than the outer StreamingResponse status
+        # which is always 200 regardless of upstream errors.
+        original_body = response.body_iterator
+
+        async def wrapped_body():
+            try:
+                async for chunk in original_body:
+                    yield chunk
+            finally:
+                # Read upstream status from request.state — set by _stream_response's
+                # generate() by the time we reach here (stream is fully consumed).
+                upstream_status = str(getattr(request.state, "stream_status", 500))
+                ACTIVE_CONNECTIONS.dec()
+                stream_elapsed = time.time() - start
+                user = getattr(request.state, "user", "anonymous")
+                normalized = _normalize_path(path)
+                REQUEST_COUNT.labels(user=user, method=request.method, path=normalized, status_code=upstream_status).inc()
+                REQUEST_LATENCY.labels(user=user, method=request.method, path=normalized).observe(stream_elapsed)
+
+        response.body_iterator = wrapped_body()
+    else:
+        ACTIVE_CONNECTIONS.dec()
+        user = getattr(request.state, "user", "anonymous")
+        normalized = _normalize_path(path)
+        status_code = str(response.status_code)
+        REQUEST_COUNT.labels(user=user, method=request.method, path=normalized, status_code=status_code).inc()
+        REQUEST_LATENCY.labels(user=user, method=request.method, path=normalized).observe(elapsed)
+
     response.headers["X-Response-Time"] = f"{elapsed:.3f}s"
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "*"
     return response
+
+
+# Known path buckets for Prometheus labels (bounded cardinality)
+_KNOWN_PATHS = {
+    "/v1/messages", "/v1/models", "/v1/organizations",
+    "/v1/messages/batches",
+}
+
+def _normalize_path(path: str) -> str:
+    """Normalize URL path to a fixed set of buckets for metrics labels."""
+    if path in _KNOWN_PATHS:
+        return path
+    if path.startswith("/v1/"):
+        return "/v1/other"
+    return "/other"
 
 
 @app.exception_handler(HTTPException)
@@ -208,6 +321,24 @@ async def generic_error_handler(request: Request, exc: Exception):
 
 # --- Endpoints ---
 
+@app.get("/metrics")
+async def metrics(request: Request, x_api_key: str | None = Header(None),
+                  authorization: str | None = Header(None)):
+    """Prometheus metrics endpoint (requires authentication)."""
+    api_key = extract_api_key(x_api_key, authorization)
+    try:
+        user = validate_key(api_key)
+    except HTTPException:
+        return PlainTextResponse(
+            "Unauthorized\n",
+            status_code=401,
+            media_type="text/plain",
+            headers={"WWW-Authenticate": 'Bearer realm="aproxy"'},
+        )
+    log.info(f"[{user}] GET /metrics")
+    return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.get("/health")
 async def health():
     try:
@@ -215,13 +346,13 @@ async def health():
         ollama_version = r.json().get("version", "unknown") if r.status_code == 200 else "unreachable"
     except Exception:
         ollama_version = "unreachable"
-    return {"status": "ok", "ollama": {"version": ollama_version}, "proxy": "aproxy/1.4"}
+    return {"status": "ok", "ollama": {"version": ollama_version}, "proxy": "aproxy/1.6"}
 
 
 @app.get("/v1/models")
-async def list_models(x_api_key: str | None = Header(None), authorization: str | None = Header(None)):
+async def list_models(request: Request, x_api_key: str | None = Header(None), authorization: str | None = Header(None)):
     api_key = extract_api_key(x_api_key, authorization)
-    user = await validate_key_async(api_key)
+    user = await validate_key_async(api_key, request)
     audit(user, "GET", "/v1/models")
 
     try:
@@ -237,7 +368,7 @@ async def messages(request: Request, x_api_key: str | None = Header(None),
                    authorization: str | None = Header(None)):
     """Main Anthropic Messages API endpoint - proxied to Ollama."""
     api_key = extract_api_key(x_api_key, authorization)
-    user = await validate_key_async(api_key)
+    user = await validate_key_async(api_key, request)
 
     body = await request.body()
     body_json = json.loads(body) if body else {}
@@ -266,7 +397,7 @@ async def messages(request: Request, x_api_key: str | None = Header(None),
 
     try:
         if stream:
-            return await _stream_response(client, user, model, body, headers)
+            return await _stream_response(request, client, user, model, body, headers)
         else:
             r = await client.post("/v1/messages", content=body, headers=headers)
 
@@ -295,12 +426,20 @@ async def messages(request: Request, x_api_key: str | None = Header(None),
         return make_error(500, "api_error", f"Proxy error: {e}")
 
 
-async def _stream_response(http_client, user: str, model: str, body: bytes, headers: dict):
+async def _stream_response(request: Request, http_client, user: str, model: str, body: bytes, headers: dict):
     """Stream response from Ollama back to client."""
+    # Initialise to 500 — the generator will overwrite with the real upstream status.
+    # The middleware reads this via request.state.stream_status for Prometheus metrics.
+    request.state.stream_status = 500
+    stream_status = 500  # default to error unless we get a real status
+
     async def generate():
+        nonlocal stream_status
         total_tokens = {}
         try:
             async with http_client.stream("POST", "/v1/messages", content=body, headers=headers) as resp:
+                stream_status = resp.status_code
+                request.state.stream_status = resp.status_code
                 if resp.status_code != 200:
                     error_body = await resp.aread()
                     audit(user, "POST", "/v1/messages", model=model, status=resp.status_code, error=error_body.decode()[:200])
@@ -321,7 +460,13 @@ async def _stream_response(http_client, user: str, model: str, body: bytes, head
             audit(user, "POST", "/v1/messages", model=model, status=200, tokens=total_tokens if total_tokens else None)
         except Exception as e:
             log.error(f"[{user}] Stream error: {e}")
+            request.state.stream_status = 500
             audit(user, "POST", "/v1/messages", model=model, status=500, error=str(e))
+        finally:
+            # Metrics (REQUEST_COUNT, REQUEST_LATENCY, ACTIVE_CONNECTIONS)
+            # are recorded by the middleware via wrapped_body() after the
+            # client finishes consuming the stream.  Only audit log here.
+            pass
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -331,7 +476,7 @@ async def messages_batches(request: Request, x_api_key: str | None = Header(None
                             authorization: str | None = Header(None)):
     """Message batches - return not supported."""
     api_key = extract_api_key(x_api_key, authorization)
-    await validate_key_async(api_key)
+    await validate_key_async(api_key, request)
     return make_error(404, "not_found", "Message batches are not supported by this proxy")
 
 
@@ -341,16 +486,16 @@ async def messages_batches(request: Request, x_api_key: str | None = Header(None
 async def organizations(request: Request, x_api_key: str | None = Header(None),
                          authorization: str | None = Header(None)):
     api_key = extract_api_key(x_api_key, authorization)
-    user = await validate_key_async(api_key)
+    user = await validate_key_async(api_key, request)
     audit(user, "GET", "/v1/organizations")
     return {"data": [], "has_more": False}
 
 
 @app.api_route("/v1/organizations/{org_id}/users", methods=["GET"])
-async def org_users(org_id: str, x_api_key: str | None = Header(None),
+async def org_users(org_id: str, request: Request, x_api_key: str | None = Header(None),
                     authorization: str | None = Header(None)):
     api_key = extract_api_key(x_api_key, authorization)
-    user = await validate_key_async(api_key)
+    user = await validate_key_async(api_key, request)
     audit(user, "GET", f"/v1/organizations/{org_id}/users")
     return {"data": [], "has_more": False}
 
@@ -363,7 +508,7 @@ async def catch_all(request: Request, path: str, x_api_key: str | None = Header(
                      authorization: str | None = Header(None)):
     """Proxy any unmatched paths to Ollama with authentication."""
     api_key = extract_api_key(x_api_key, authorization)
-    user = await validate_key_async(api_key)
+    user = await validate_key_async(api_key, request)
     audit(user, request.method, f"/{path}")
 
     # Build headers for Ollama
