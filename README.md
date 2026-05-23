@@ -446,6 +446,60 @@ scripts/smoke_claude_via_aproxy.sh --no-logs
 APROXY_LOG_HOST=10.200.0.58 scripts/smoke_claude_via_aproxy.sh
 ```
 
+### Integration suite Claude Code
+
+Для более реалистичной проверки используйте отдельный набор:
+
+```bash
+scripts/integration_claude_code_suite.sh
+```
+
+В отличие от smoke-теста, integration suite **не передаёт `--model`** в
+`claude -p`. Это намеренно: тест эмулирует обычную работу разработчика, где
+Claude Code сам выбирает модельные tier-ы из переменных `.env`:
+
+- `ANTHROPIC_DEFAULT_OPUS_MODEL`;
+- `ANTHROPIC_DEFAULT_SONNET_MODEL`;
+- `ANTHROPIC_DEFAULT_HAIKU_MODEL`.
+
+Скрипт выполняет preflight `aproxy`, затем headless-сценарии Claude Code:
+
+- простой prompt/response;
+- правка файла во временной директории;
+- shell workflow во временной директории;
+- проверка отсутствия SSE-регрессии `Could not parse message into JSON`;
+- итоговая проверка `/metrics`;
+- анализ свежих записей `audit.jsonl`, какие default model id реально
+  использовал Claude Code.
+
+Для автоматических файловых и shell-проверок скрипт запускает Claude Code с
+`--permission-mode bypassPermissions`; все правки выполняются только во
+временных директориях `mktemp`.
+
+Опциональные расширения:
+
+```bash
+# WebFetch/WebSearch проверки
+scripts/integration_claude_code_suite.sh --web
+
+# Длинные shell/output сценарии
+scripts/integration_claude_code_suite.sh --long
+
+# Capability probe для agent/background поведения
+scripts/integration_claude_code_suite.sh --agent
+
+# Всё вместе
+scripts/integration_claude_code_suite.sh --full
+
+# Считать ошибкой, если в свежем audit не появились все три default model tier
+scripts/integration_claude_code_suite.sh --require-all-tiers
+```
+
+Важно: отсутствие одного из tier в коротком прогоне не всегда означает дефект
+`aproxy`; это может означать, что Claude Code не выбрал этот tier для данных
+сценариев. Для обязательного покрытия используйте более сложные сценарии и
+проверяйте свежие audit-записи.
+
 ### Безопасность
 
 1. **`keys.json` и `.env` содержат секреты.** Они исключены из git через `.gitignore`. Права:
