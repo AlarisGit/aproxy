@@ -40,10 +40,35 @@ def _integration_env(integration_token: str) -> dict:
 
 
 def _default_model() -> str:
+    """Pick the best available Ollama model for integration tests.
+
+    Prefers larger reasoning-capable models for complex multi-tool prompts,
+    falling back to any available model. Override with APROXY_INTEGRATION_MODEL.
+    """
+    explicit = os.environ.get("APROXY_INTEGRATION_MODEL")
+    if explicit:
+        return explicit
+
     r = httpx.get(f"{OLLAMA_URL}/api/tags")
     r.raise_for_status()
     models = r.json().get("models", [])
     assert models, "Ollama has no models pulled"
+    names = {m["name"] for m in models}
+
+    preferred = [
+        "kimi-k2.7-code:cloud",
+        "kimi-k2.5:cloud",
+        "deepseek-v4-pro:cloud",
+        "deepseek-v4-flash:cloud",
+        "glm-5.1:cloud",
+        "gemma4:31b-cloud",
+        "gemini-3-flash-preview:latest",
+        "gpt-oss:120b-cloud",
+    ]
+    for name in preferred:
+        if name in names:
+            return name
+
     return models[0]["name"]
 
 
