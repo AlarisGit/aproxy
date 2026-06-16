@@ -222,11 +222,43 @@ systemctl --user enable --now aproxy
 | `PROXY_LOG` | *(пусто)* | Путь к файлу лога приложения (дополнительно к journald) |
 | `APROXY_MAX_BODY_SIZE` | `52428800` (50 MiB) | Максимальный размер тела запроса в байтах. Запросы без `Content-Length` или превышающие лимит отклоняются с HTTP 413 |
 | `APROXY_KEY_RELOAD_INTERVAL` | `1.0` | Интервал в секундах между проверками изменений `keys.json` |
+| `APROXY_DEFAULT_OPUS_MODEL` | *(пусто)* | Ollama-модель, в которую транслировать Anthropic OPUS model IDs (`claude-opus-*`) |
+| `APROXY_DEFAULT_SONNET_MODEL` | *(пусто)* | Ollama-модель, в которую транслировать Anthropic SONNET model IDs (`claude-sonnet-*`) |
+| `APROXY_DEFAULT_HAIKU_MODEL` | *(пусто)* | Ollama-модель, в которую транслировать Anthropic HAIKU model IDs (`claude-haiku-*`) |
 
 После изменения `.env` — перезапустить сервис:
 ```bash
 systemctl --user restart aproxy
 ```
+
+### Автоматическая трансляция Anthropic model IDs
+
+Claude Code по умолчанию запрашивает свои "родные" модели (`claude-opus-*`,
+`claude-sonnet-*`, `claude-haiku-*`). Если их не переопределить, Ollama
+возвращает ошибку `model not found`, потому что в Ollama эти имена отсутствуют.
+
+aproxy может автоматически подменять Anthropic model IDs на Ollama-модели. Для
+этого задайте в `.env` переменные:
+
+```bash
+APROXY_DEFAULT_OPUS_MODEL=kimi-k2.7-code:cloud
+APROXY_DEFAULT_SONNET_MODEL=kimi-k2.5:cloud
+APROXY_DEFAULT_HAIKU_MODEL=devstral-small-2:24b-cloud
+```
+
+Правила:
+
+- Если клиент прислал имя, начинающееся с `claude-opus-` / `claude-sonnet-` /
+  `claude-haiku-`, aproxy заменяет его на соответствующую Ollama-модель из `.env`.
+- Если переменная для tier не задана, aproxy выбирает первую доступную
+  Ollama-модель из каталога, чтобы Claude Code всё равно работал.
+- Если клиент прислал уже Ollama-имя (например, `--model kimi-k2.7-code:cloud`
+  или `ANTHROPIC_DEFAULT_*_MODEL` настроены в клиентском `.env`), aproxy не
+  трогает запрос.
+
+Это позволяет администратору централизованно управлять тем, какие локальные
+модели используются для каждого tier Anthropic, не заставляя каждого
+разработчика вручную настраивать `ANTHROPIC_DEFAULT_OPUS_MODEL` и т.д.
 
 ### Тестирование
 
