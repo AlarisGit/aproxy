@@ -50,9 +50,8 @@ class TestMessagesNonStreaming:
             "AVAILABLE_OLLAMA_MODELS",
             {"kimi-k2.7-code:cloud", "devstral-small-2:24b-cloud"},
         )
-        proxy.DEFAULT_MODEL_TIER["opus"] = "kimi-k2.7-code:cloud"
-        proxy.DEFAULT_MODEL_TIER["sonnet"] = ""
-        proxy.DEFAULT_MODEL_TIER["haiku"] = ""
+        proxy._model_mapper.mapping = {"opus": "kimi-k2.7-code:cloud"}
+        proxy._model_mapper.default = ""
 
         captured_body = {}
 
@@ -92,7 +91,8 @@ class TestMessagesNonStreaming:
             "AVAILABLE_OLLAMA_MODELS",
             {"devstral-small-2:24b-cloud"},
         )
-        proxy.DEFAULT_MODEL_TIER["opus"] = "kimi-k2.7-code:cloud"
+        proxy._model_mapper.mapping = {"opus": "kimi-k2.7-code:cloud"}
+        proxy._model_mapper.default = ""
 
         respx.post("http://127.0.0.1:11434/v1/messages").respond(
             200,
@@ -118,6 +118,47 @@ class TestMessagesNonStreaming:
         assert response.status_code == 200
         # Response should come back with the same model the user requested
         assert response.json()["model"] == "devstral-small-2:24b-cloud"
+
+    @respx.mock
+    def test_messages_falls_back_to_default_when_tier_missing(self, client, auth_headers, monkeypatch):
+        """If the tier mapping points to a missing Ollama model, default is used."""
+        monkeypatch.setattr(
+            proxy,
+            "AVAILABLE_OLLAMA_MODELS",
+            {"kimi-k2.5:cloud", "devstral-small-2:24b-cloud"},
+        )
+        proxy._model_mapper.mapping = {"opus": "non-existent-model"}
+        proxy._model_mapper.default = "kimi-k2.5:cloud"
+
+        captured_body = {}
+
+        def capture_request(request):
+            captured_body["model"] = json.loads(request.content).get("model")
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_01",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Hello"}],
+                    "model": "kimi-k2.5:cloud",
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 5, "output_tokens": 1},
+                },
+            )
+
+        respx.post("http://127.0.0.1:11434/v1/messages").mock(side_effect=capture_request)
+        response = client.post(
+            "/v1/messages",
+            headers=auth_headers,
+            json={
+                "model": "claude-opus-4-7",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert response.status_code == 200
+        assert captured_body["model"] == "kimi-k2.5:cloud"
 
     @respx.mock
     def test_messages_returns_upstream_status_on_failure(self, client, auth_headers):
