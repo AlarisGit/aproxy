@@ -690,6 +690,8 @@ async def messages(request: Request, x_api_key: str | None = Header(None),
         headers["anthropic-beta"] = ab
 
     log.info(f"[{user}] POST /v1/messages model={model} (requested={requested_model}) stream={stream}")
+    if os.environ.get("APROXY_DEBUG_BODY"):
+        log.info(f"[{user}] request body: {body.decode('utf-8', errors='replace')[:4000]}")
 
     try:
         if stream:
@@ -706,6 +708,8 @@ async def messages(request: Request, x_api_key: str | None = Header(None),
 
             if r.status_code != 200:
                 log.warning(f"[{user}] Ollama error {r.status_code}: {r.text[:500]}")
+                if os.environ.get("APROXY_DEBUG_BODY"):
+                    log.info(f"[{user}] Ollama error body: {r.text[:4000]}")
                 audit(user, "POST", "/v1/messages", model=model, status=r.status_code, error=r.text[:200])
 
             return JSONResponse(
