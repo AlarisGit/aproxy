@@ -748,6 +748,7 @@ async def _stream_response(request: Request, http_client, user: str, model: str,
             total_tokens = {}
 
             async def generate():
+                stream_broken = False
                 try:
                     async for line in resp.aiter_lines():
                         # Preserve upstream SSE framing. Ollama's Anthropic-compatible
@@ -768,8 +769,24 @@ async def _stream_response(request: Request, http_client, user: str, model: str,
                                     total_tokens.update(event["usage"])
                             except (json.JSONDecodeError, KeyError):
                                 pass
+                except httpx.StreamClosed:
+                    log.error(f"[{user}] Ollama closed the stream unexpectedly")
+                    stream_broken = True
+                except Exception as e:
+                    log.error(f"[{user}] Error while streaming from Ollama: {e}")
+                    stream_broken = True
                 finally:
-                    audit(user, "POST", "/v1/messages", model=model, status=200, tokens=total_tokens if total_tokens else None)
+                    audit(user, "POST", "/v1/messages", model=model, status=200 if not stream_broken else 500, tokens=total_tokens if total_tokens else None, error="stream closed by Ollama" if stream_broken else None)
+                    if stream_broken:
+                        # Emit a final SSE error event so the client sees a clean failure
+                        error_event = {
+                            "type": "error",
+                            "error": {
+                                "type": "internal_error",
+                                "message": "Ollama closed the stream unexpectedly. Check that the requested model is loaded and available.",
+                            },
+                        }
+                        yield f"event: error\ndata: {json.dumps(error_event)}\n\n"
 
             return StreamingResponse(generate(), media_type="text/event-stream")
 
