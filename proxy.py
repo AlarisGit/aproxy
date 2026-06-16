@@ -62,6 +62,7 @@ def _hash_token(salt: str, token: str) -> str:
 
 def _load_keys() -> tuple[dict, dict, str | None]:
     """Load key file. Returns (plain_keys, hashed_users, salt).
+
     plain_keys:  {token: username} for legacy format
     hashed_users: {hash_hex: username} for hashed format
     salt: hex string for hashed format (None for legacy-only files)
@@ -80,24 +81,75 @@ def _load_keys() -> tuple[dict, dict, str | None]:
     return {}, users, salt
 
 
-API_KEYS, _HASHED_USERS, _SALT = _load_keys()
+class _KeyStore:
+    """In-memory key cache with lazy reload on keys.json modification.
+
+    Reloading is cheap enough that it runs once per request, but mtime is only
+    checked every KEY_RELOAD_INTERVAL seconds to avoid stat storms.
+    """
+
+    def __init__(self):
+        self.api_keys: dict = {}
+        self.hashed_users: dict = {}
+        self.salt: str | None = None
+        self._mtime: float = 0.0
+        self._last_check: float = 0.0
+        self._load()
+
+    def _load(self):
+        try:
+            self.api_keys, self.hashed_users, self.salt = _load_keys()
+            self._mtime = os.path.getmtime(_keys_file)
+            log.info(f"Loaded {self.key_count()} key(s) from {_keys_file}")
+        except Exception as e:
+            log.error(f"Failed to load keys from {_keys_file}: {e}")
+            # Keep previous keys on error; fail-closed would lock everyone out.
+
+    def key_count(self) -> int:
+        return len(self.api_keys) + len(self.hashed_users)
+
+    def reload_if_changed(self):
+        now = time.time()
+        if now - self._last_check < KEY_RELOAD_INTERVAL:
+            return
+        self._last_check = now
+        try:
+            current_mtime = os.path.getmtime(_keys_file)
+        except FileNotFoundError:
+            if self.key_count() > 0:
+                log.warning(f"Key file {_keys_file} disappeared; keeping cached keys")
+            return
+        except Exception as e:
+            log.error(f"Cannot stat key file: {e}")
+            return
+
+        if current_mtime != self._mtime:
+            log.info(f"Key file changed (mtime {self._mtime} -> {current_mtime}), reloading")
+            self._load()
+
+
+# Minimum seconds between mtime checks for keys.json.
+KEY_RELOAD_INTERVAL = float(os.environ.get("APROXY_KEY_RELOAD_INTERVAL", "1.0"))
 
 
 def validate_key(api_key: str | None) -> str:
     """Validate authentication token. Returns username.
-    Tries legacy plaintext lookup first, then hashed lookup."""
+    Tries legacy plaintext lookup first, then hashed lookup.
+    Reloads keys.json if it has been modified since the last check."""
     if not api_key:
         raise HTTPException(status_code=401, detail={"type": "authentication_error", "message": "Authentication required. Set ANTHROPIC_AUTH_TOKEN or provide a valid key."})
 
+    _key_store.reload_if_changed()
+
     # Legacy: direct token lookup
-    if api_key in API_KEYS:
-        return API_KEYS[api_key]
+    if api_key in _key_store.api_keys:
+        return _key_store.api_keys[api_key]
 
     # Hashed: compute SHA-256(salt + token) and look up
-    if _SALT:
-        token_hash = "sha256$" + _hash_token(_SALT, api_key)
-        if token_hash in _HASHED_USERS:
-            return _HASHED_USERS[token_hash]
+    if _key_store.salt:
+        token_hash = "sha256$" + _hash_token(_key_store.salt, api_key)
+        if token_hash in _key_store.hashed_users:
+            return _key_store.hashed_users[token_hash]
 
     raise HTTPException(status_code=401, detail={"type": "authentication_error", "message": "Invalid authentication token. Check your ANTHROPIC_AUTH_TOKEN or key value."})
 
@@ -119,6 +171,9 @@ if PROXY_LOG:
     _fh = logging.FileHandler(PROXY_LOG)
     _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     log.addHandler(_fh)
+
+# Initialise the key store now that the logger is configured.
+_key_store = _KeyStore()
 
 # --- Metrics (Prometheus) ---
 REQUEST_COUNT = Counter(
@@ -654,7 +709,7 @@ if __name__ == "__main__":
             _write_keyfile(data)
             print(f"Added user '{username}' with token '{token}'")
             print(f"Token hash: sha256${_hash_token(data['_salt'], token)[:16]}...")
-            print("Restart aproxy to reload keys.")
+            print("Keys will be picked up automatically by the running service.")
 
         elif _cmd == "migrate":
             data = _read_keyfile()
@@ -674,7 +729,7 @@ if __name__ == "__main__":
             print(f"Migrated {len(new_users)} token(s) to hashed format.")
             print("Plaintext tokens have been replaced with SHA-256 hashes.")
             print("Keep a backup of the old tokens if needed — they cannot be recovered from hashes.")
-            print("Restart aproxy to reload keys.")
+            print("Keys will be picked up automatically by the running service.")
 
         elif _cmd == "list":
             data = _read_keyfile()
@@ -713,7 +768,7 @@ if __name__ == "__main__":
                     del data[t]
                 _write_keyfile(data)
                 print(f"Removed {len(to_remove)} key(s) for user '{username}'.")
-            print("Restart aproxy to reload keys.")
+            print("Keys will be picked up automatically by the running service.")
 
         else:
             print("Usage: proxy.py keys <command> [args]")
