@@ -155,6 +155,31 @@ class TestClaudeCodeIntegration:
         assert proc.returncode == 0, f"claude failed: stdout={proc.stdout!r} stderr={proc.stderr!r}"
         assert "aproxy integration test passed" in proc.stdout
 
+    def test_claude_code_without_model_arg_uses_server_mapping(self, integration_token):
+        """Claude Code's default Anthropic model ID is translated by aproxy."""
+        if not os.path.exists(CLAUDE):
+            pytest.skip("Claude Code CLI not found at /home/sergey/.local/bin/claude")
+
+        env = _integration_env(integration_token)
+        # Intentionally omit --model so Claude uses its internal default.
+        proc = subprocess.run(
+            [
+                CLAUDE,
+                "-p",
+                "Say exactly: server mapping test passed",
+                "--bare",
+                "--dangerously-skip-permissions",
+                "--no-session-persistence",
+            ],
+            env=env,
+            cwd="/home/sergey/Projects/aproxy",
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert proc.returncode == 0, f"claude failed: stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        assert "server mapping test passed" in proc.stdout
+
 
 @pytest.mark.skipif(
     os.environ.get("APROXY_RUN_INTEGRATION_TESTS") != "1",
