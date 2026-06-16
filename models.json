@@ -1,7 +1,7 @@
 {
-  "default": "kimi-k2.7-code:cloud",
+  "default": "deepseek-v4-pro:cloud",
   "anthropic_mapping": {
-    "opus": "kimi-k2.7-code:cloud",
+    "opus": "glm-5.2:cloud",
     "sonnet": "kimi-k2.7-code:cloud",
     "haiku": "devstral-small-2:24b-cloud"
   }
