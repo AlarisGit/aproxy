@@ -1,6 +1,7 @@
 """Tests for POST /v1/messages proxying."""
 
 import httpx
+import json
 import pytest
 import respx
 
@@ -39,6 +40,84 @@ class TestMessagesNonStreaming:
         assert response.status_code == 200
         body = response.json()
         assert body["content"][0]["text"] == "Hello"
+
+    @respx.mock
+    def test_messages_maps_anthropic_model_to_ollama(self, client, auth_headers, monkeypatch):
+        """When Claude Code sends an Anthropic model ID, aproxy should translate
+        it to a configured Ollama model before forwarding the request."""
+        monkeypatch.setattr(
+            proxy,
+            "AVAILABLE_OLLAMA_MODELS",
+            {"kimi-k2.7-code:cloud", "devstral-small-2:24b-cloud"},
+        )
+        proxy.DEFAULT_MODEL_TIER["opus"] = "kimi-k2.7-code:cloud"
+        proxy.DEFAULT_MODEL_TIER["sonnet"] = ""
+        proxy.DEFAULT_MODEL_TIER["haiku"] = ""
+
+        captured_body = {}
+
+        def capture_request(request):
+            captured_body["model"] = json.loads(request.content).get("model")
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_01",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Hello"}],
+                    "model": "kimi-k2.7-code:cloud",
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 5, "output_tokens": 1},
+                },
+            )
+
+        respx.post("http://127.0.0.1:11434/v1/messages").mock(side_effect=capture_request)
+        response = client.post(
+            "/v1/messages",
+            headers=auth_headers,
+            json={
+                "model": "claude-opus-4-7",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert response.status_code == 200
+        assert captured_body["model"] == "kimi-k2.7-code:cloud"
+
+    @respx.mock
+    def test_messages_leaves_ollama_model_untouched(self, client, auth_headers, monkeypatch):
+        """If the client already passes a native Ollama model, no mapping happens."""
+        monkeypatch.setattr(
+            proxy,
+            "AVAILABLE_OLLAMA_MODELS",
+            {"devstral-small-2:24b-cloud"},
+        )
+        proxy.DEFAULT_MODEL_TIER["opus"] = "kimi-k2.7-code:cloud"
+
+        respx.post("http://127.0.0.1:11434/v1/messages").respond(
+            200,
+            json={
+                "id": "msg_01",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Hello"}],
+                "model": "devstral-small-2:24b-cloud",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 5, "output_tokens": 1},
+            },
+        )
+        response = client.post(
+            "/v1/messages",
+            headers=auth_headers,
+            json={
+                "model": "devstral-small-2:24b-cloud",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert response.status_code == 200
+        # Response should come back with the same model the user requested
+        assert response.json()["model"] == "devstral-small-2:24b-cloud"
 
     @respx.mock
     def test_messages_returns_upstream_status_on_failure(self, client, auth_headers):
