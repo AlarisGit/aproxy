@@ -24,6 +24,7 @@ import logging
 import os
 import secrets
 import sys
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -575,9 +576,26 @@ if __name__ == "__main__":
             return {}
 
         def _write_keyfile(data):
-            with open(_keys_file, "w") as f:
-                json.dump(data, f, indent=2)
-            os.chmod(_keys_file, 0o600)
+            """Write keys.json atomically with restrictive permissions.
+
+            Uses a temporary file in the same directory and os.replace() so a
+            crash or disk-full event never leaves keys.json empty or partial.
+            """
+            key_dir = os.path.dirname(os.path.abspath(_keys_file))
+            os.makedirs(key_dir, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(dir=key_dir, prefix=".keys.json.tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(data, f, indent=2)
+                    f.write("\n")
+                os.chmod(tmp_path, 0o600)
+                os.replace(tmp_path, _keys_file)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except FileNotFoundError:
+                    pass
+                raise
 
         if _cmd == "add":
             if len(sys.argv) < 4:
