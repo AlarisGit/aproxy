@@ -25,6 +25,7 @@ import os
 import secrets
 import sys
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import httpx
@@ -141,8 +142,24 @@ ACTIVE_CONNECTIONS = Gauge(
 )
 
 # --- App ---
-app = FastAPI(title="aproxy", docs_url=None, redoc_url=None, openapi_url=None)
-client = httpx.AsyncClient(base_url=OLLAMA_BASE, timeout=httpx.Timeout(300.0))
+
+client: httpx.AsyncClient
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage httpx client lifecycle across startup/shutdown."""
+    global client
+    client = httpx.AsyncClient(base_url=OLLAMA_BASE, timeout=httpx.Timeout(300.0))
+    log.info(f"httpx client ready for Ollama at {OLLAMA_BASE}")
+    try:
+        yield
+    finally:
+        await client.aclose()
+        log.info("httpx client closed")
+
+
+app = FastAPI(title="aproxy", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 
 
 def make_error(status_code: int, error_type: str, message: str) -> JSONResponse:
