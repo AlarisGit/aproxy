@@ -1,6 +1,7 @@
 # Secrets — никогда не коммитить
 keys.json
 models.json
+aproxy.json
 .env
 .env.*
 

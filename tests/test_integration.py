@@ -1,8 +1,8 @@
 """End-to-end integration tests that exercise the full Claude Code → aproxy → Ollama path.
 
 These tests require:
-  - aproxy running on ANTHROPIC_PROXY_HOST:ANTHROPIC_PROXY_PORT (default 127.0.0.1:4001)
-  - Ollama running on OLLAMA_BASE_URL (default http://127.0.0.1:11434) with at least one model
+  - aproxy running on the host/port configured in aproxy.json (default 127.0.0.1:4001)
+  - Ollama running on the URL configured in aproxy.json (default http://127.0.0.1:11434) with at least one model
   - the `claude` CLI on PATH
 
 They are skipped unless the environment variable APROXY_RUN_INTEGRATION_TESTS=1 is set.

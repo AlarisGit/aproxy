@@ -1,5 +1,6 @@
 """Shared pytest fixtures for aproxy tests."""
 
+import json
 from contextlib import asynccontextmanager
 
 import pytest
@@ -21,9 +22,11 @@ def test_token():
 
 
 @pytest.fixture
-def authenticated_key_store(test_token, test_user):
+def authenticated_key_store(test_token, test_user, tmp_path):
     """Provide a key store preloaded with a test token, without touching keys.json."""
-    store = proxy._KeyStore()
+    keys_file = tmp_path / "keys.json"
+    keys_file.write_text(json.dumps({"_salt": "abc", "users": {}}))
+    store = proxy._KeyStore(str(keys_file))
     store.api_keys = {test_token: test_user}
     store.hashed_users = {}
     store.salt = None

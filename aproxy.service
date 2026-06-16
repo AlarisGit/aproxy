@@ -4,7 +4,6 @@ After=network.target
 
 [Service]
 Type=simple
-EnvironmentFile=/home/sergey/Projects/aproxy/.env
 ExecStart=/home/sergey/Projects/aproxy/.venv/bin/python3 /home/sergey/Projects/aproxy/proxy.py
 Restart=on-failure
 RestartSec=5

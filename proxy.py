@@ -35,6 +35,58 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 
+# --- Server configuration ---
+# All server settings live in a single JSON config file (default aproxy.json).
+# Users remain in keys.json. Model mapping remains in models.json and is the only
+# part of the configuration that is hot-reloaded without a service restart.
+# Changes to port, paths, Ollama URL, etc. require a service restart.
+
+_CONFIG_FILE = os.environ.get("APROXY_CONFIG", "/home/sergey/Projects/aproxy/aproxy.json")
+
+
+def _load_config(path: str) -> dict:
+    """Load server configuration from JSON file with fallback defaults."""
+    defaults = {
+        "ollama_base_url": "http://127.0.0.1:11434",
+        "port": 4001,
+        "keys_file": "/home/sergey/Projects/aproxy/keys.json",
+        "models_file": "/home/sergey/Projects/aproxy/models.json",
+        "audit_log": "/var/log/aproxy/audit.jsonl",
+        "proxy_log": "/var/log/aproxy/proxy.log",
+        "max_body_size": 50 * 1024 * 1024,
+        "key_reload_interval": 1.0,
+    }
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(f"aproxy: config file {path} not found, using defaults", file=sys.stderr)
+        return defaults
+    except Exception as e:
+        print(f"aproxy: failed to load config {path}: {e}, using defaults", file=sys.stderr)
+        return defaults
+
+    # Merge with defaults so missing keys do not break the server.
+    merged = {**defaults, **data}
+    return merged
+
+
+CONFIG = _load_config(_CONFIG_FILE)
+
+# --- Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("aproxy")
+
+# File logging (in addition to journald via StandardOutput/StandardError)
+if CONFIG.get("proxy_log"):
+    _fh = logging.FileHandler(CONFIG["proxy_log"])
+    _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    log.addHandler(_fh)
+
 # --- Anthropic -> Ollama model mapping ---
 # Claude Code ships with hard-coded Anthropic model IDs (claude-opus-*,
 # claude-sonnet-*, claude-haiku-*). When running against Ollama those names do
@@ -58,7 +110,7 @@ from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTEN
 #   model is used; if the default is also invalid, the first available Ollama
 #   model is used. A warning is logged whenever a fallback happens.
 
-_models_file = os.environ.get("MODELS_FILE", "/home/sergey/Projects/aproxy/models.json")
+_models_file = CONFIG["models_file"]
 
 
 class _ModelMapper:
@@ -149,13 +201,13 @@ class _ModelMapper:
 
 
 # --- Configuration ---
-OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-PORT = int(os.environ.get("ANTHROPIC_PROXY_PORT", "4001"))
+OLLAMA_BASE = CONFIG["ollama_base_url"]
+PORT = int(CONFIG["port"])
 
 # Max request body size in bytes. Requests larger than this are rejected before
 # the body is read, protecting the proxy from memory pressure and oversized
 # audit log writes. Default: 50 MiB.
-MAX_BODY_SIZE = int(os.environ.get("APROXY_MAX_BODY_SIZE", str(50 * 1024 * 1024)))
+MAX_BODY_SIZE = int(CONFIG["max_body_size"])
 
 # --- Key store ---
 # Supports two formats in keys.json:
@@ -164,7 +216,7 @@ MAX_BODY_SIZE = int(os.environ.get("APROXY_MAX_BODY_SIZE", str(50 * 1024 * 1024)
 # Hashed format stores SHA-256(salt + token) so plaintext tokens never touch disk.
 # The validate_key function tries both formats for backward compatibility.
 
-_keys_file = os.environ.get("API_KEYS_FILE", "/home/sergey/Projects/aproxy/keys.json")
+_keys_file = CONFIG["keys_file"]
 SALT_LEN = 32  # bytes
 
 
@@ -173,16 +225,16 @@ def _hash_token(salt: str, token: str) -> str:
     return hashlib.sha256((salt + token).encode()).hexdigest()
 
 
-def _load_keys() -> tuple[dict, dict, str | None]:
+def _load_keys(keys_path: str) -> tuple[dict, dict, str | None]:
     """Load key file. Returns (plain_keys, hashed_users, salt).
 
     plain_keys:  {token: username} for legacy format
     hashed_users: {hash_hex: username} for hashed format
     salt: hex string for hashed format (None for legacy-only files)
     """
-    if not os.path.exists(_keys_file):
+    if not os.path.exists(keys_path):
         return {}, {}, None
-    with open(_keys_file) as f:
+    with open(keys_path) as f:
         data = json.load(f)
 
     # Legacy format: flat dict of token -> username
@@ -201,9 +253,10 @@ class _KeyStore:
     checked every KEY_RELOAD_INTERVAL seconds to avoid stat storms.
     """
 
-    def __init__(self):
-        self.api_keys: dict = {}
-        self.hashed_users: dict = {}
+    def __init__(self, keys_path: str):
+        self.keys_path = keys_path
+        self.api_keys: dict[str, str] = {}
+        self.hashed_users: dict[str, str] = {}
         self.salt: str | None = None
         self._mtime: float = 0.0
         self._last_check: float = 0.0
@@ -211,15 +264,17 @@ class _KeyStore:
 
     def _load(self):
         try:
-            self.api_keys, self.hashed_users, self.salt = _load_keys()
-            self._mtime = os.path.getmtime(_keys_file)
-            log.info(f"Loaded {self.key_count()} key(s) from {_keys_file}")
+            self.api_keys, self.hashed_users, self.salt = _load_keys(self.keys_path)
+            try:
+                self._mtime = os.path.getmtime(self.keys_path)
+            except FileNotFoundError:
+                self._mtime = 0.0
+            except Exception as e:
+                log.error(f"Cannot stat key file {self.keys_path}: {e}")
+            count = len(self.api_keys) + len(self.hashed_users)
+            log.info(f"Loaded {count} key(s) from {self.keys_path}")
         except Exception as e:
-            log.error(f"Failed to load keys from {_keys_file}: {e}")
-            # Keep previous keys on error; fail-closed would lock everyone out.
-
-    def key_count(self) -> int:
-        return len(self.api_keys) + len(self.hashed_users)
+            log.error(f"Failed to load keys from {self.keys_path}: {e}; keeping previous keys")
 
     def reload_if_changed(self):
         now = time.time()
@@ -227,10 +282,10 @@ class _KeyStore:
             return
         self._last_check = now
         try:
-            current_mtime = os.path.getmtime(_keys_file)
+            current_mtime = os.path.getmtime(self.keys_path)
         except FileNotFoundError:
-            if self.key_count() > 0:
-                log.warning(f"Key file {_keys_file} disappeared; keeping cached keys")
+            if self._mtime != 0.0:
+                log.warning(f"Key file {self.keys_path} disappeared; keeping cached keys")
             return
         except Exception as e:
             log.error(f"Cannot stat key file: {e}")
@@ -242,7 +297,7 @@ class _KeyStore:
 
 
 # Minimum seconds between mtime checks for keys.json.
-KEY_RELOAD_INTERVAL = float(os.environ.get("APROXY_KEY_RELOAD_INTERVAL", "1.0"))
+KEY_RELOAD_INTERVAL = float(CONFIG["key_reload_interval"])
 
 
 def validate_key(api_key: str | None) -> str:
@@ -267,26 +322,11 @@ def validate_key(api_key: str | None) -> str:
     raise HTTPException(status_code=401, detail={"type": "authentication_error", "message": "Invalid authentication token. Check your ANTHROPIC_AUTH_TOKEN or key value."})
 
 # Audit log
-AUDIT_LOG = os.environ.get("AUDIT_LOG", "/var/log/aproxy/audit.jsonl")
+AUDIT_LOG = CONFIG["audit_log"]
 AUDIT_ENABLED = bool(AUDIT_LOG)
 
-# --- Logging ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger("aproxy")
-
-# File logging (in addition to journald via StandardOutput/StandardError)
-PROXY_LOG = os.environ.get("PROXY_LOG")
-if PROXY_LOG:
-    _fh = logging.FileHandler(PROXY_LOG)
-    _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
-    log.addHandler(_fh)
-
-# Initialise the key store and model mapper now that the logger is configured.
-_key_store = _KeyStore()
+# Initialise the key store and model mapper.
+_key_store = _KeyStore(_keys_file)
 _model_mapper = _ModelMapper()
 
 # --- Metrics (Prometheus) ---

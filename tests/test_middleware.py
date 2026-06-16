@@ -39,7 +39,7 @@ class TestKeyReload:
         monkeypatch.setattr("proxy._keys_file", str(keys_file))
         monkeypatch.setattr("proxy.KEY_RELOAD_INTERVAL", 0.0)
 
-        store = proxy._KeyStore()
+        store = proxy._KeyStore(str(keys_file))
         monkeypatch.setattr("proxy._key_store", store)
         assert store.api_keys == {test_token: test_user}
 
@@ -61,7 +61,7 @@ class TestKeyReload:
         monkeypatch.setattr("proxy._keys_file", str(keys_file))
         monkeypatch.setattr("proxy.KEY_RELOAD_INTERVAL", 0.0)
 
-        store = proxy._KeyStore()
+        store = proxy._KeyStore(str(keys_file))
         monkeypatch.setattr("proxy._key_store", store)
         assert store.api_keys == {test_token: test_user}
 
