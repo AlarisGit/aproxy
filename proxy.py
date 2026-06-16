@@ -369,7 +369,11 @@ AVAILABLE_OLLAMA_MODELS: set[str] = set()
 async def lifespan(app: FastAPI):
     """Manage httpx client lifecycle across startup/shutdown."""
     global client, AVAILABLE_OLLAMA_MODELS
-    client = httpx.AsyncClient(base_url=OLLAMA_BASE, timeout=httpx.Timeout(300.0))
+    client = httpx.AsyncClient(
+        base_url=OLLAMA_BASE,
+        timeout=httpx.Timeout(300.0),
+        limits=httpx.Limits(max_keepalive_connections=0, max_connections=100),
+    )
     log.info(f"httpx client ready for Ollama at {OLLAMA_BASE}")
     try:
         r = await client.get("/api/tags")
