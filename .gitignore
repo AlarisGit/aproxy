@@ -1,5 +1,6 @@
 # Secrets — никогда не коммитить
 keys.json
+models.json
 .env
 .env.*
 
