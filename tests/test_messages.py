@@ -213,6 +213,57 @@ class TestMessagesStreaming:
         assert response.headers["content-type"].startswith("text/event-stream")
 
     @pytest.mark.asyncio
+    async def test_streaming_keeps_upstream_open_until_body_is_consumed(
+        self, async_client, auth_headers, monkeypatch
+    ):
+        class _LazyResponse:
+            status_code = 200
+            headers = {"content-type": "text/event-stream"}
+
+            def __init__(self, stream):
+                self.stream = stream
+                self.iterated = False
+
+            async def aiter_lines(self):
+                if self.stream.exited:
+                    raise httpx.StreamClosed()
+                self.iterated = True
+                yield 'data: {"type":"content_block_delta"}'
+                yield ""
+                yield 'data: {"type":"message_delta","usage":{"input_tokens":5,"output_tokens":1}}'
+                yield ""
+
+        class _FakeStream:
+            def __init__(self):
+                self.entered = False
+                self.exited = False
+                self.response = _LazyResponse(self)
+
+            async def __aenter__(self):
+                self.entered = True
+                return self.response
+
+            async def __aexit__(self, *args):
+                self.exited = True
+                return False
+
+        stream = _FakeStream()
+        monkeypatch.setattr(proxy.client, "stream", lambda *args, **kwargs: stream)
+
+        response = await async_client.post(
+            "/v1/messages",
+            headers=auth_headers,
+            json={"model": "test", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+        assert response.status_code == 200
+        assert stream.entered
+        assert stream.response.iterated
+        assert stream.exited
+        assert 'data: {"type":"content_block_delta"}' in response.text
+        assert "Ollama closed the stream unexpectedly" not in response.text
+
+    @pytest.mark.asyncio
     async def test_streaming_messages_returns_real_status_on_upstream_error(
         self, async_client, auth_headers, monkeypatch
     ):

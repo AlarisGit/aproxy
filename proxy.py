@@ -741,79 +741,88 @@ async def _stream_response(request: Request, http_client, user: str, model: str,
     request.state.stream_status = 500
 
     try:
-        async with http_client.stream("POST", "/v1/messages", content=body, headers=headers) as resp:
-            request.state.stream_status = resp.status_code
+        stream_cm = http_client.stream("POST", "/v1/messages", content=body, headers=headers)
+        resp = await stream_cm.__aenter__()
+        request.state.stream_status = resp.status_code
 
-            if resp.status_code != 200:
+        if resp.status_code != 200:
+            try:
                 error_body = await resp.aread()
-                error_text = error_body.decode("utf-8", errors="replace")
-                audit(user, "POST", "/v1/messages", model=model, status=resp.status_code, error=error_text[:200])
-                return JSONResponse(
-                    status_code=resp.status_code,
-                    content=error_body_to_content(error_body, resp.headers.get("content-type", "")),
-                )
+            finally:
+                await stream_cm.__aexit__(None, None, None)
+            error_text = error_body.decode("utf-8", errors="replace")
+            audit(user, "POST", "/v1/messages", model=model, status=resp.status_code, error=error_text[:200])
+            return JSONResponse(
+                status_code=resp.status_code,
+                content=error_body_to_content(error_body, resp.headers.get("content-type", "")),
+            )
 
-            total_tokens = {}
+        total_tokens = {}
 
-            async def generate():
-                stream_broken = False
-                client_disconnected = False
-                yielded_any = False
+        async def generate():
+            stream_broken = False
+            client_disconnected = False
+            yielded_any = False
+            try:
+                async for line in resp.aiter_lines():
+                    yielded_any = True
+                    # Preserve upstream SSE framing. Ollama's Anthropic-compatible
+                    # stream emits multi-line events such as:
+                    #   event: message_start
+                    #   data: {...}
+                    #
+                    # Emitting "\n\n" after every line turns the event line into
+                    # a standalone empty event, which Claude Code then tries to
+                    # parse as JSON. Add one newline per upstream line and let
+                    # upstream blank lines terminate each SSE event.
+                    yield line + "\n"
+                    # Try to extract token counts from stream data events
+                    if line.startswith("data: ") and ('"type":"message_delta"' in line or '"type": "message_delta"' in line):
+                        try:
+                            event = json.loads(line.removeprefix("data: ").strip())
+                            if "usage" in event:
+                                total_tokens.update(event["usage"])
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+            except httpx.StreamClosed:
+                if yielded_any:
+                    client_disconnected = True
+                    log.info(f"[{user}] client disconnected during stream")
+                else:
+                    stream_broken = True
+                    log.error(f"[{user}] Ollama closed the stream unexpectedly before any data")
+            except Exception as e:
+                if yielded_any:
+                    client_disconnected = True
+                    log.warning(f"[{user}] stream error after yielding data: {e}")
+                else:
+                    stream_broken = True
+                    log.error(f"[{user}] Error while streaming from Ollama: {e}")
+            finally:
+                status = 200 if not stream_broken else 500
+                request.state.stream_status = status
+                error_msg = None
+                if client_disconnected:
+                    error_msg = "client disconnected"
+                elif stream_broken:
+                    error_msg = "stream closed by Ollama"
+                audit(user, "POST", "/v1/messages", model=model, status=status, tokens=total_tokens if total_tokens else None, error=error_msg)
                 try:
-                    async for line in resp.aiter_lines():
-                        yielded_any = True
-                        # Preserve upstream SSE framing. Ollama's Anthropic-compatible
-                        # stream emits multi-line events such as:
-                        #   event: message_start
-                        #   data: {...}
-                        #
-                        # Emitting "\n\n" after every line turns the event line into
-                        # a standalone empty event, which Claude Code then tries to
-                        # parse as JSON. Add one newline per upstream line and let
-                        # upstream blank lines terminate each SSE event.
-                        yield line + "\n"
-                        # Try to extract token counts from stream data events
-                        if line.startswith("data: ") and ('"type":"message_delta"' in line or '"type": "message_delta"' in line):
-                            try:
-                                event = json.loads(line.removeprefix("data: ").strip())
-                                if "usage" in event:
-                                    total_tokens.update(event["usage"])
-                            except (json.JSONDecodeError, KeyError):
-                                pass
-                except httpx.StreamClosed:
-                    if yielded_any:
-                        client_disconnected = True
-                        log.info(f"[{user}] client disconnected during stream")
-                    else:
-                        stream_broken = True
-                        log.error(f"[{user}] Ollama closed the stream unexpectedly before any data")
+                    await stream_cm.__aexit__(None, None, None)
                 except Exception as e:
-                    if yielded_any:
-                        client_disconnected = True
-                        log.warning(f"[{user}] stream error after yielding data: {e}")
-                    else:
-                        stream_broken = True
-                        log.error(f"[{user}] Error while streaming from Ollama: {e}")
-                finally:
-                    status = 200 if not stream_broken else 500
-                    error_msg = None
-                    if client_disconnected:
-                        error_msg = "client disconnected"
-                    elif stream_broken:
-                        error_msg = "stream closed by Ollama"
-                    audit(user, "POST", "/v1/messages", model=model, status=status, tokens=total_tokens if total_tokens else None, error=error_msg)
-                    if stream_broken:
-                        # Emit a final SSE error event so the client sees a clean failure
-                        error_event = {
-                            "type": "error",
-                            "error": {
-                                "type": "internal_error",
-                                "message": "Ollama closed the stream unexpectedly. Check that the requested model is loaded and available.",
-                            },
-                        }
-                        yield f"event: error\ndata: {json.dumps(error_event)}\n\n"
+                    log.warning(f"[{user}] error closing Ollama stream: {e}")
+                if stream_broken:
+                    # Emit a final SSE error event so the client sees a clean failure
+                    error_event = {
+                        "type": "error",
+                        "error": {
+                            "type": "internal_error",
+                            "message": "Ollama closed the stream unexpectedly. Check that the requested model is loaded and available.",
+                        },
+                    }
+                    yield f"event: error\ndata: {json.dumps(error_event)}\n\n"
 
-            return StreamingResponse(generate(), media_type="text/event-stream")
+        return StreamingResponse(generate(), media_type="text/event-stream")
 
     except httpx.ReadTimeout:
         log.error(f"[{user}] Ollama stream timeout")
