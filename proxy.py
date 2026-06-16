@@ -35,6 +35,52 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 
+# --- Anthropic -> Ollama model mapping ---
+# Claude Code ships with hard-coded Anthropic model IDs. When running against
+# Ollama, those IDs must be translated to local model names. Users can still
+# override per tier via env variables; if a request already uses a model that
+# exists in Ollama, we leave it untouched.
+DEFAULT_MODEL_TIER = {
+    "opus": os.environ.get("APROXY_DEFAULT_OPUS_MODEL", ""),
+    "sonnet": os.environ.get("APROXY_DEFAULT_SONNET_MODEL", ""),
+    "haiku": os.environ.get("APROXY_DEFAULT_HAIKU_MODEL", ""),
+}
+
+
+def _resolve_model(requested: str, available: set[str] | None = None) -> tuple[str, str | None]:
+    """Translate Anthropic model IDs to Ollama model names.
+
+    Returns (final_model, original_model). If the requested model already
+    looks like an Ollama model (not a claude-* prefix) it is returned as-is.
+    """
+    requested_lower = requested.lower()
+    if not requested_lower.startswith("claude-"):
+        return requested, None
+
+    tier = None
+    if "opus" in requested_lower:
+        tier = "opus"
+    elif "sonnet" in requested_lower:
+        tier = "sonnet"
+    elif "haiku" in requested_lower:
+        tier = "haiku"
+
+    mapped = DEFAULT_MODEL_TIER.get(tier, "") if tier else ""
+    if mapped:
+        return mapped, requested
+
+    # No env override configured: fall back to an available Ollama model when
+    # we know the catalog. This keeps Claude Code usable even without per-tier
+    # env variables, although it loses the tier distinction.
+    if available:
+        for preferred in ("kimi-k2.7-code:cloud", "kimi-k2.5:cloud", "deepseek-v4-pro:cloud"):
+            if preferred in available:
+                return preferred, requested
+        return next(iter(available)), requested
+
+    return requested, None
+
+
 # --- Configuration ---
 OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 PORT = int(os.environ.get("ANTHROPIC_PROXY_PORT", "4001"))
@@ -207,13 +253,23 @@ ACTIVE_CONNECTIONS = Gauge(
 client: httpx.AsyncClient
 
 
+# Global populated during lifespan: set of model names available in Ollama.
+AVAILABLE_OLLAMA_MODELS: set[str] = set()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage httpx client lifecycle across startup/shutdown."""
-    global client
+    global client, AVAILABLE_OLLAMA_MODELS
     client = httpx.AsyncClient(base_url=OLLAMA_BASE, timeout=httpx.Timeout(300.0))
     log.info(f"httpx client ready for Ollama at {OLLAMA_BASE}")
     try:
+        r = await client.get("/api/tags")
+        if r.status_code == 200:
+            AVAILABLE_OLLAMA_MODELS = {m.get("name", "") for m in r.json().get("models", [])}
+            log.info(f"Discovered {len(AVAILABLE_OLLAMA_MODELS)} Ollama models")
+        else:
+            log.warning(f"Could not fetch Ollama model list: {r.status_code}")
         yield
     finally:
         await client.aclose()
@@ -493,8 +549,19 @@ async def messages(request: Request, x_api_key: str | None = Header(None),
     body = await request.body()
     body_json = json.loads(body) if body else {}
 
-    model = body_json.get("model", "unknown")
+    requested_model = body_json.get("model", "unknown")
     stream = body_json.get("stream", False)
+
+    # Translate Anthropic model IDs to Ollama model names. If the user supplied a
+    # native Ollama model name, leave it untouched.
+    resolved_model, original_model = _resolve_model(requested_model, AVAILABLE_OLLAMA_MODELS or None)
+    if resolved_model != requested_model:
+        body_json["model"] = resolved_model
+        body = json.dumps(body_json).encode("utf-8")
+        if original_model:
+            log.info(f"[{user}] mapped Anthropic model {original_model} -> {resolved_model}")
+
+    model = resolved_model
 
     # Build headers for Ollama
     # Always send Authorization: Bearer ollama so Ollama accepts the request
@@ -513,7 +580,7 @@ async def messages(request: Request, x_api_key: str | None = Header(None),
     if ab:
         headers["anthropic-beta"] = ab
 
-    log.info(f"[{user}] POST /v1/messages model={model} stream={stream}")
+    log.info(f"[{user}] POST /v1/messages model={model} (requested={requested_model}) stream={stream}")
 
     try:
         if stream:
