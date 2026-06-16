@@ -1,9 +1,10 @@
 # Secrets — никогда не коммитить
 keys.json
-models.json
-aproxy.json
 .env
 .env.*
+
+# Runtime config templates with site-specific paths can stay tracked; override
+# via APROXY_CONFIG if your paths differ.
 
 # Logs
 *.log

@@ -1,0 +1,10 @@
+{
+  "ollama_base_url": "http://127.0.0.1:11434",
+  "port": 4001,
+  "keys_file": "/home/sergey/Projects/aproxy/keys.json",
+  "models_file": "/home/sergey/Projects/aproxy/models.json",
+  "audit_log": "/var/log/aproxy/audit.jsonl",
+  "proxy_log": "/var/log/aproxy/proxy.log",
+  "max_body_size": 52428800,
+  "key_reload_interval": 1.0
+}
