@@ -431,7 +431,8 @@ tail -f /var/log/aproxy/proxy.log
 
 Ротируется logrotate (14 дней).
 
-**Аудит-лог** `/var/log/aproxy/audit.jsonl` — JSONL, одна запись на запрос:
+**Аудит-лог** `/var/log/aproxy/audit.jsonl` — JSONL, одна запись на
+аутентифицированный запрос к прокси:
 
 ```bash
 # Просмотр
@@ -439,25 +440,41 @@ tail -f /var/log/aproxy/audit.jsonl
 
 # Пример записи
 {"ts":"2026-05-19T08:53:53.995847+00:00","key":"sergey","method":"GET","path":"/v1/models"}
-{"ts":"2026-05-19T08:54:12.123456+00:00","key":"sk-TzM5...","method":"POST","path":"/v1/messages","model":"deepseek-v4-pro:cloud","status":200,"tokens":{"input_tokens":150,"output_tokens":320}}
+{"ts":"2026-05-19T08:54:12.123456+00:00","key":"sergey","method":"POST","path":"/v1/messages","model":"deepseek-v4-pro:cloud","status":200,"tokens":{"input_tokens":150,"output_tokens":320}}
 ```
 
 Поля:
 - `ts` — ISO 8601, UTC
-- `key` — маскированный токен (первые 8 символов + `...`) или имя пользователя
+- `key` — имя пользователя из `keys.json`; длинные значения сокращаются до первых 8 символов + `...`
 - `method` / `path` — HTTP метод и путь
-- `model` — запрошенная модель (если есть)
-- `status` — HTTP статус ответа Ollama
-- `tokens` — использование токенов (если доступно)
+- `model` — фактическая upstream-модель после server-side mapping (если есть)
+- `status` — HTTP статус ответа upstream или итоговый статус streaming-запроса (если есть)
+- `tokens` — использование токенов из upstream `usage` (если доступно)
 - `error` — текст ошибки (если есть)
+
+Для `/v1/messages` audit-запись создаётся после ответа upstream. В non-streaming
+режиме токены берутся из JSON-поля `usage`. В streaming-режиме `aproxy` объединяет
+usage из SSE-событий `message_start.message.usage` и `message_delta.usage`, сохраняя
+последние cumulative-значения. Если upstream не прислал usage или клиент оборвал
+стрим до финального usage-события, `tokens` в audit-записи не будет либо он будет
+неполным. Неуспешная аутентификация не попадает в audit-log, но учитывается в
+Prometheus request metrics как `user="anonymous"`.
 
 Ротируется logrotate (30 дней).
 
 ### Метрики Prometheus
 
-Эндпоинт `GET /metrics` отдаёт метрики в формате Prometheus. Требует аутентификации. Единственный публичный эндпоинт — `/health`.
+Эндпоинт `GET /metrics` отдаёт стандартный Prometheus text exposition format:
 
-**Доступные метрики:**
+```http
+Content-Type: text/plain; version=1.0.0; charset=utf-8
+```
+
+Требует аутентификации. Единственный публичный эндпоинт — `/health`.
+В ответе есть стандартные runtime-метрики Python `prometheus_client` и прикладные
+метрики `aproxy_*`.
+
+**Основные прикладные метрики:**
 
 | Метрика | Тип | Лейблы | Описание |
 |---|---|---|---|
@@ -466,6 +483,24 @@ tail -f /var/log/aproxy/audit.jsonl
 | `aproxy_tokens_input_total` | counter | user, model | Входные токены (input_tokens) |
 | `aproxy_tokens_output_total` | counter | user, model | Выходные токены (output_tokens) |
 | `aproxy_active_connections` | gauge | — | Текущее количество активных соединений |
+
+`aproxy_requests_total` и `aproxy_request_duration_seconds` считаются middleware
+для API-запросов к прокси. `/health` и `/metrics` не включаются, чтобы health-check
+и scrape Prometheus не искажали аналитику использования. Oversized/unbounded body,
+отклонённый до входа в endpoint, также не считается proxied request. Для streaming
+запросов latency и request counter фиксируются после завершения чтения SSE-стрима,
+а `status_code` берётся из итогового состояния стрима, не из внешнего HTTP 200
+`StreamingResponse`.
+
+Пример строк Prometheus:
+```text
+# HELP aproxy_requests_total Total proxied requests
+# TYPE aproxy_requests_total counter
+aproxy_requests_total{method="POST",path="/v1/messages",status_code="200",user="sergey"} 42.0
+# HELP aproxy_tokens_input_total Total input tokens proxied
+# TYPE aproxy_tokens_input_total counter
+aproxy_tokens_input_total{model="deepseek-v4-pro:cloud",user="sergey"} 12345.0
+```
 
 Пример запросов:
 ```bash

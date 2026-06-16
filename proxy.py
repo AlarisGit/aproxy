@@ -410,6 +410,26 @@ def error_body_to_content(error_body: bytes, content_type: str) -> dict:
     return {"type": "error", "error": {"type": "api_error", "message": text[:500]}}
 
 
+def _merge_usage(target: dict, usage: dict | None):
+    """Merge token usage fields from an upstream event into the final usage map."""
+    if isinstance(usage, dict):
+        target.update(usage)
+
+
+def _merge_stream_usage_from_line(line: str, total_tokens: dict):
+    """Extract usage from one SSE data line, preserving the latest cumulative values."""
+    if not line.startswith("data:"):
+        return
+    try:
+        event = json.loads(line[5:].strip())
+    except json.JSONDecodeError:
+        return
+
+    if isinstance(event.get("message"), dict):
+        _merge_usage(total_tokens, event["message"].get("usage"))
+    _merge_usage(total_tokens, event.get("usage"))
+
+
 def audit(user_key: str, method: str, path: str, model: str | None = None,
           status: int | None = None, tokens: dict | None = None, error: str | None = None):
     """Write audit record and update Prometheus metrics."""
@@ -703,18 +723,20 @@ async def messages(request: Request, x_api_key: str | None = Header(None),
         else:
             r = await client.post("/v1/messages", content=body, headers=headers)
 
-            resp_body = r.json() if r.status_code == 200 else None
             tokens = None
-            if resp_body and "usage" in resp_body:
-                tokens = resp_body["usage"]
+            error_text = None
 
-            audit(user, "POST", "/v1/messages", model=model, status=r.status_code, tokens=tokens)
-
-            if r.status_code != 200:
+            if r.status_code == 200:
+                resp_body = r.json()
+                if "usage" in resp_body:
+                    tokens = resp_body["usage"]
+            else:
                 log.warning(f"[{user}] Ollama error {r.status_code}: {r.text[:500]}")
                 if os.environ.get("APROXY_DEBUG_BODY"):
                     log.info(f"[{user}] Ollama error body: {r.text[:4000]}")
-                audit(user, "POST", "/v1/messages", model=model, status=r.status_code, error=r.text[:200])
+                error_text = r.text[:200]
+
+            audit(user, "POST", "/v1/messages", model=model, status=r.status_code, tokens=tokens, error=error_text)
 
             return JSONResponse(
                 status_code=r.status_code,
@@ -776,14 +798,7 @@ async def _stream_response(request: Request, http_client, user: str, model: str,
                     # parse as JSON. Add one newline per upstream line and let
                     # upstream blank lines terminate each SSE event.
                     yield line + "\n"
-                    # Try to extract token counts from stream data events
-                    if line.startswith("data: ") and ('"type":"message_delta"' in line or '"type": "message_delta"' in line):
-                        try:
-                            event = json.loads(line.removeprefix("data: ").strip())
-                            if "usage" in event:
-                                total_tokens.update(event["usage"])
-                        except (json.JSONDecodeError, KeyError):
-                            pass
+                    _merge_stream_usage_from_line(line, total_tokens)
             except httpx.StreamClosed:
                 if yielded_any:
                     client_disconnected = True

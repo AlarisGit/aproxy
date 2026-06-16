@@ -35,7 +35,10 @@ class TestMetrics:
     def test_metrics_returns_prometheus_with_auth(self, client, auth_headers):
         response = client.get("/metrics", headers=auth_headers)
         assert response.status_code == 200
-        assert response.headers["content-type"].startswith("text/plain")
+        assert response.headers["content-type"].startswith("text/plain; version=1.0.0")
+        assert "# HELP aproxy_requests_total" in response.text
+        assert "# TYPE aproxy_requests_total counter" in response.text
+        assert "# HELP aproxy_tokens_input_total" in response.text
         assert "aproxy_requests_total" in response.text
 
 

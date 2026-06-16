@@ -161,7 +161,10 @@ class TestMessagesNonStreaming:
         assert captured_body["model"] == "kimi-k2.5:cloud"
 
     @respx.mock
-    def test_messages_returns_upstream_status_on_failure(self, client, auth_headers):
+    def test_messages_returns_upstream_status_on_failure(self, client, auth_headers, monkeypatch):
+        audit_records = []
+        monkeypatch.setattr(proxy, "audit", lambda *args, **kwargs: audit_records.append((args, kwargs)))
+
         respx.post("http://127.0.0.1:11434/v1/messages").respond(
             502,
             json={"error": {"message": "ollama down"}},
@@ -174,9 +177,27 @@ class TestMessagesNonStreaming:
         assert response.status_code == 502
         body = response.json()
         assert "ollama" in body.get("detail", body.get("error", "")).get("message", "").lower()
+        assert len(audit_records) == 1
+        assert audit_records[0][0][:3] == ("tester", "POST", "/v1/messages")
+        assert audit_records[0][1]["status"] == 502
+        assert "ollama down" in audit_records[0][1]["error"]
 
 
 class TestMessagesStreaming:
+    def test_streaming_usage_merges_message_start_and_delta_events(self):
+        total_tokens = {}
+
+        proxy._merge_stream_usage_from_line(
+            'data: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":1}}}',
+            total_tokens,
+        )
+        proxy._merge_stream_usage_from_line(
+            'data: {"type":"message_delta","usage":{"output_tokens":3}}',
+            total_tokens,
+        )
+
+        assert total_tokens == {"input_tokens": 5, "output_tokens": 3}
+
     @pytest.mark.asyncio
     async def test_streaming_messages_forwards_sse_on_success(
         self, async_client, auth_headers, monkeypatch
