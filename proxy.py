@@ -753,8 +753,11 @@ async def _stream_response(request: Request, http_client, user: str, model: str,
 
             async def generate():
                 stream_broken = False
+                client_disconnected = False
+                yielded_any = False
                 try:
                     async for line in resp.aiter_lines():
+                        yielded_any = True
                         # Preserve upstream SSE framing. Ollama's Anthropic-compatible
                         # stream emits multi-line events such as:
                         #   event: message_start
@@ -774,13 +777,27 @@ async def _stream_response(request: Request, http_client, user: str, model: str,
                             except (json.JSONDecodeError, KeyError):
                                 pass
                 except httpx.StreamClosed:
-                    log.error(f"[{user}] Ollama closed the stream unexpectedly")
-                    stream_broken = True
+                    if yielded_any:
+                        client_disconnected = True
+                        log.info(f"[{user}] client disconnected during stream")
+                    else:
+                        stream_broken = True
+                        log.error(f"[{user}] Ollama closed the stream unexpectedly before any data")
                 except Exception as e:
-                    log.error(f"[{user}] Error while streaming from Ollama: {e}")
-                    stream_broken = True
+                    if yielded_any:
+                        client_disconnected = True
+                        log.warning(f"[{user}] stream error after yielding data: {e}")
+                    else:
+                        stream_broken = True
+                        log.error(f"[{user}] Error while streaming from Ollama: {e}")
                 finally:
-                    audit(user, "POST", "/v1/messages", model=model, status=200 if not stream_broken else 500, tokens=total_tokens if total_tokens else None, error="stream closed by Ollama" if stream_broken else None)
+                    status = 200 if not stream_broken else 500
+                    error_msg = None
+                    if client_disconnected:
+                        error_msg = "client disconnected"
+                    elif stream_broken:
+                        error_msg = "stream closed by Ollama"
+                    audit(user, "POST", "/v1/messages", model=model, status=status, tokens=total_tokens if total_tokens else None, error=error_msg)
                     if stream_broken:
                         # Emit a final SSE error event so the client sees a clean failure
                         error_event = {
