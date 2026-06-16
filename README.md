@@ -205,6 +205,7 @@ systemctl --user enable --now aproxy
 | `API_KEYS_FILE` | `/home/sergey/Projects/aproxy/keys.json` | Путь к файлу токенов |
 | `AUDIT_LOG` | `/var/log/aproxy/audit.jsonl` | Путь к аудит-логу (пустое значение отключает аудит) |
 | `PROXY_LOG` | *(пусто)* | Путь к файлу лога приложения (дополнительно к journald) |
+| `APROXY_MAX_BODY_SIZE` | `52428800` (50 MiB) | Максимальный размер тела запроса в байтах. Без `Content-Length` запрос отклоняется |
 
 После изменения `.env` — перезапустить сервис:
 ```bash

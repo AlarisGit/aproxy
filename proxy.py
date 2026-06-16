@@ -39,6 +39,11 @@ from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTEN
 OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 PORT = int(os.environ.get("ANTHROPIC_PROXY_PORT", "4001"))
 
+# Max request body size in bytes. Requests larger than this are rejected before
+# the body is read, protecting the proxy from memory pressure and oversized
+# audit log writes. Default: 50 MiB.
+MAX_BODY_SIZE = int(os.environ.get("APROXY_MAX_BODY_SIZE", str(50 * 1024 * 1024)))
+
 # --- Key store ---
 # Supports two formats in keys.json:
 #   Legacy (plaintext):  {"sk-xxx": "user1", "sk-yyy": "user2"}
@@ -240,11 +245,42 @@ async def validate_key_async(api_key: str | None, request: Request | None = None
     return user
 
 
+def _body_too_large(request: Request) -> tuple[bool, int | None]:
+    """Check Content-Length against MAX_BODY_SIZE. Returns (rejected, limit)."""
+    content_length = request.headers.get("content-length")
+    if content_length is None:
+        # Reject chunked or otherwise unbounded bodies to avoid unbounded reads.
+        return True, MAX_BODY_SIZE
+    try:
+        length = int(content_length)
+    except ValueError:
+        return True, MAX_BODY_SIZE
+    if length > MAX_BODY_SIZE:
+        return True, MAX_BODY_SIZE
+    return False, None
+
+
 @app.middleware("http")
 async def add_cors_and_timing(request: Request, call_next):
     # Paths that are skipped from proxied-request metrics
     _SKIP_METRICS = {"/health", "/metrics"}
     path = request.url.path
+
+    # Reject oversized or unbounded request bodies before reading them.
+    if request.method in {"POST", "PUT", "PATCH"}:
+        rejected, limit = _body_too_large(request)
+        if rejected:
+            log.warning(f"Request body too large or unbounded: {path} (limit={limit})")
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "request_too_large",
+                        "message": f"Request body exceeds maximum allowed size of {limit} bytes.",
+                    },
+                },
+            )
 
     if path in _SKIP_METRICS:
         start = time.time()
