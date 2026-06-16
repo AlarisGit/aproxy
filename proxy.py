@@ -574,9 +574,18 @@ async def _stream_response(request: Request, http_client, user: str, model: str,
             async def generate():
                 try:
                     async for line in resp.aiter_lines():
-                        yield line + "\n\n"
-                        # Try to extract token counts from stream events
-                        if '"type":"message_delta"' in line or '"type": "message_delta"' in line:
+                        # Preserve upstream SSE framing. Ollama's Anthropic-compatible
+                        # stream emits multi-line events such as:
+                        #   event: message_start
+                        #   data: {...}
+                        #
+                        # Emitting "\n\n" after every line turns the event line into
+                        # a standalone empty event, which Claude Code then tries to
+                        # parse as JSON. Add one newline per upstream line and let
+                        # upstream blank lines terminate each SSE event.
+                        yield line + "\n"
+                        # Try to extract token counts from stream data events
+                        if line.startswith("data: ") and ('"type":"message_delta"' in line or '"type": "message_delta"' in line):
                             try:
                                 event = json.loads(line.removeprefix("data: ").strip())
                                 if "usage" in event:
