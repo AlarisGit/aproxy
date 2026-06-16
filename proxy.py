@@ -36,49 +36,116 @@ from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 
 # --- Anthropic -> Ollama model mapping ---
-# Claude Code ships with hard-coded Anthropic model IDs. When running against
-# Ollama, those IDs must be translated to local model names. Users can still
-# override per tier via env variables; if a request already uses a model that
-# exists in Ollama, we leave it untouched.
-DEFAULT_MODEL_TIER = {
-    "opus": os.environ.get("APROXY_DEFAULT_OPUS_MODEL", ""),
-    "sonnet": os.environ.get("APROXY_DEFAULT_SONNET_MODEL", ""),
-    "haiku": os.environ.get("APROXY_DEFAULT_HAIKU_MODEL", ""),
-}
+# Claude Code ships with hard-coded Anthropic model IDs (claude-opus-*,
+# claude-sonnet-*, claude-haiku-*). When running against Ollama those names do
+# not exist, so aproxy translates them to local model names. The mapping lives
+# in a dedicated models.json file which is reloaded without a service restart.
+#
+# models.json schema:
+# {
+#   "default": "kimi-k2.7-code:cloud",
+#   "anthropic_mapping": {
+#     "opus": "kimi-k2.7-code:cloud",
+#     "sonnet": "kimi-k2.5:cloud",
+#     "haiku": "devstral-small-2:24b-cloud"
+#   }
+# }
+#
+# Resolution rules:
+# - If the requested model is not a claude-* ID, it is forwarded unchanged.
+# - The tier (opus/sonnet/haiku) is looked up in anthropic_mapping.
+# - If the mapped model is missing or does not exist in Ollama, the default
+#   model is used; if the default is also invalid, the first available Ollama
+#   model is used. A warning is logged whenever a fallback happens.
+
+_models_file = os.environ.get("MODELS_FILE", "/home/sergey/Projects/aproxy/models.json")
 
 
-def _resolve_model(requested: str, available: set[str] | None = None) -> tuple[str, str | None]:
-    """Translate Anthropic model IDs to Ollama model names.
+class _ModelMapper:
+    """Hot-reloadable Anthropic -> Ollama model mapping."""
 
-    Returns (final_model, original_model). If the requested model already
-    looks like an Ollama model (not a claude-* prefix) it is returned as-is.
-    """
-    requested_lower = requested.lower()
-    if not requested_lower.startswith("claude-"):
+    def __init__(self):
+        self.default: str = ""
+        self.mapping: dict[str, str] = {}
+        self._mtime: float = 0.0
+        self._last_check: float = 0.0
+        self._load()
+
+    def _load(self):
+        try:
+            with open(_models_file) as f:
+                data = json.load(f)
+            self.default = data.get("default", "")
+            self.mapping = data.get("anthropic_mapping", {})
+            self._mtime = os.path.getmtime(_models_file)
+            log.info(f"Loaded model mapping from {_models_file}: default={self.default!r}, tiers={list(self.mapping)}")
+        except FileNotFoundError:
+            log.warning(f"Model mapping file {_models_file} not found; model translation disabled")
+            self.default = ""
+            self.mapping = {}
+            self._mtime = 0.0
+        except Exception as e:
+            log.error(f"Failed to load model mapping from {_models_file}: {e}; keeping previous mapping")
+
+    def reload_if_changed(self):
+        now = time.time()
+        if now - self._last_check < KEY_RELOAD_INTERVAL:
+            return
+        self._last_check = now
+        try:
+            current_mtime = os.path.getmtime(_models_file)
+        except FileNotFoundError:
+            if self._mtime != 0.0:
+                log.warning(f"Model mapping file {_models_file} disappeared; keeping cached mapping")
+            return
+        except Exception as e:
+            log.error(f"Cannot stat model mapping file: {e}")
+            return
+
+        if current_mtime != self._mtime:
+            log.info(f"Model mapping file changed (mtime {self._mtime} -> {current_mtime}), reloading")
+            self._load()
+
+    def resolve(self, requested: str, available: set[str]) -> tuple[str, str | None]:
+        """Return (final_model, original_model).
+
+        original_model is non-None only when a translation actually happened.
+        """
+        requested_lower = requested.lower()
+        if not requested_lower.startswith("claude-"):
+            return requested, None
+
+        tier = None
+        if "opus" in requested_lower:
+            tier = "opus"
+        elif "sonnet" in requested_lower:
+            tier = "sonnet"
+        elif "haiku" in requested_lower:
+            tier = "haiku"
+
+        candidates = []
+        if tier:
+            mapped = self.mapping.get(tier, "")
+            if mapped:
+                candidates.append((mapped, f"tier '{tier}' mapping"))
+        if self.default:
+            candidates.append((self.default, "default model"))
+        if available:
+            for preferred in ("kimi-k2.7-code:cloud", "kimi-k2.5:cloud", "deepseek-v4-pro:cloud"):
+                if preferred in available:
+                    candidates.append((preferred, "preferred available model"))
+                    break
+            candidates.append((next(iter(available)), "first available model"))
+
+        for model, source in candidates:
+            if model and model in available:
+                if model != requested:
+                    log.info(f"Mapped Anthropic model {requested} -> {model} (using {source})")
+                return model, requested
+
+        # Nothing valid found, return original and let upstream fail cleanly.
+        log.warning(f"Could not resolve Anthropic model {requested}; no valid Ollama model available")
         return requested, None
-
-    tier = None
-    if "opus" in requested_lower:
-        tier = "opus"
-    elif "sonnet" in requested_lower:
-        tier = "sonnet"
-    elif "haiku" in requested_lower:
-        tier = "haiku"
-
-    mapped = DEFAULT_MODEL_TIER.get(tier, "") if tier else ""
-    if mapped:
-        return mapped, requested
-
-    # No env override configured: fall back to an available Ollama model when
-    # we know the catalog. This keeps Claude Code usable even without per-tier
-    # env variables, although it loses the tier distinction.
-    if available:
-        for preferred in ("kimi-k2.7-code:cloud", "kimi-k2.5:cloud", "deepseek-v4-pro:cloud"):
-            if preferred in available:
-                return preferred, requested
-        return next(iter(available)), requested
-
-    return requested, None
 
 
 # --- Configuration ---
@@ -218,8 +285,9 @@ if PROXY_LOG:
     _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     log.addHandler(_fh)
 
-# Initialise the key store now that the logger is configured.
+# Initialise the key store and model mapper now that the logger is configured.
 _key_store = _KeyStore()
+_model_mapper = _ModelMapper()
 
 # --- Metrics (Prometheus) ---
 REQUEST_COUNT = Counter(
@@ -552,9 +620,10 @@ async def messages(request: Request, x_api_key: str | None = Header(None),
     requested_model = body_json.get("model", "unknown")
     stream = body_json.get("stream", False)
 
-    # Translate Anthropic model IDs to Ollama model names. If the user supplied a
-    # native Ollama model name, leave it untouched.
-    resolved_model, original_model = _resolve_model(requested_model, AVAILABLE_OLLAMA_MODELS or None)
+    # Translate Anthropic model IDs to Ollama model names using the hot-reloadable
+    # models.json mapping. Native Ollama model names are left untouched.
+    _model_mapper.reload_if_changed()
+    resolved_model, original_model = _model_mapper.resolve(requested_model, AVAILABLE_OLLAMA_MODELS)
     if resolved_model != requested_model:
         body_json["model"] = resolved_model
         body = json.dumps(body_json).encode("utf-8")
