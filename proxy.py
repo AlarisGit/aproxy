@@ -153,6 +153,17 @@ def make_error(status_code: int, error_type: str, message: str) -> JSONResponse:
     )
 
 
+def error_body_to_content(error_body: bytes, content_type: str) -> dict:
+    """Convert upstream error body into a safe JSON-compatible response body."""
+    if content_type.startswith("application/json"):
+        try:
+            return json.loads(error_body)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    text = error_body.decode("utf-8", errors="replace")
+    return {"type": "error", "error": {"type": "api_error", "message": text[:500]}}
+
+
 def audit(user_key: str, method: str, path: str, model: str | None = None,
           status: int | None = None, tokens: dict | None = None, error: str | None = None):
     """Write audit record and update Prometheus metrics."""
@@ -427,48 +438,57 @@ async def messages(request: Request, x_api_key: str | None = Header(None),
 
 
 async def _stream_response(request: Request, http_client, user: str, model: str, body: bytes, headers: dict):
-    """Stream response from Ollama back to client."""
-    # Initialise to 500 — the generator will overwrite with the real upstream status.
-    # The middleware reads this via request.state.stream_status for Prometheus metrics.
+    """Stream response from Ollama back to client.
+
+    We open the upstream stream first and inspect the status code before
+    committing to a StreamingResponse. This guarantees that an upstream error
+    is returned to the client with the matching HTTP status code, instead of
+    wrapping the error body in a misleading HTTP 200 StreamingResponse.
+    """
     request.state.stream_status = 500
-    stream_status = 500  # default to error unless we get a real status
 
-    async def generate():
-        nonlocal stream_status
-        total_tokens = {}
-        try:
-            async with http_client.stream("POST", "/v1/messages", content=body, headers=headers) as resp:
-                stream_status = resp.status_code
-                request.state.stream_status = resp.status_code
-                if resp.status_code != 200:
-                    error_body = await resp.aread()
-                    audit(user, "POST", "/v1/messages", model=model, status=resp.status_code, error=error_body.decode()[:200])
-                    yield error_body
-                    return
+    try:
+        async with http_client.stream("POST", "/v1/messages", content=body, headers=headers) as resp:
+            request.state.stream_status = resp.status_code
 
-                async for line in resp.aiter_lines():
-                    yield line + "\n\n"
-                    # Try to extract token counts from stream events
-                    if '"type":"message_delta"' in line or '"type": "message_delta"' in line:
-                        try:
-                            event = json.loads(line.removeprefix("data: ").strip())
-                            if "usage" in event:
-                                total_tokens.update(event["usage"])
-                        except (json.JSONDecodeError, KeyError):
-                            pass
+            if resp.status_code != 200:
+                error_body = await resp.aread()
+                error_text = error_body.decode("utf-8", errors="replace")
+                audit(user, "POST", "/v1/messages", model=model, status=resp.status_code, error=error_text[:200])
+                return JSONResponse(
+                    status_code=resp.status_code,
+                    content=error_body_to_content(error_body, resp.headers.get("content-type", "")),
+                )
 
-            audit(user, "POST", "/v1/messages", model=model, status=200, tokens=total_tokens if total_tokens else None)
-        except Exception as e:
-            log.error(f"[{user}] Stream error: {e}")
-            request.state.stream_status = 500
-            audit(user, "POST", "/v1/messages", model=model, status=500, error=str(e))
-        finally:
-            # Metrics (REQUEST_COUNT, REQUEST_LATENCY, ACTIVE_CONNECTIONS)
-            # are recorded by the middleware via wrapped_body() after the
-            # client finishes consuming the stream.  Only audit log here.
-            pass
+            total_tokens = {}
 
-    return StreamingResponse(generate(), media_type="text/event-stream")
+            async def generate():
+                try:
+                    async for line in resp.aiter_lines():
+                        yield line + "\n\n"
+                        # Try to extract token counts from stream events
+                        if '"type":"message_delta"' in line or '"type": "message_delta"' in line:
+                            try:
+                                event = json.loads(line.removeprefix("data: ").strip())
+                                if "usage" in event:
+                                    total_tokens.update(event["usage"])
+                            except (json.JSONDecodeError, KeyError):
+                                pass
+                finally:
+                    audit(user, "POST", "/v1/messages", model=model, status=200, tokens=total_tokens if total_tokens else None)
+
+            return StreamingResponse(generate(), media_type="text/event-stream")
+
+    except httpx.ReadTimeout:
+        log.error(f"[{user}] Ollama stream timeout")
+        request.state.stream_status = 504
+        audit(user, "POST", "/v1/messages", model=model, status=504, error="stream timeout")
+        return make_error(504, "timeout_error", "Ollama stream timed out")
+    except Exception as e:
+        log.error(f"[{user}] Stream error: {e}", exc_info=True)
+        request.state.stream_status = 500
+        audit(user, "POST", "/v1/messages", model=model, status=500, error=str(e))
+        return make_error(500, "api_error", f"Stream error: {e}")
 
 
 @app.post("/v1/messages/batches")
