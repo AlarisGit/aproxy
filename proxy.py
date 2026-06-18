@@ -564,7 +564,7 @@ def audit(user_key: str, method: str, path: str, model: str | None = None,
         return
     record = {
         "ts": datetime.now(timezone.utc).isoformat(),
-        "key": user_key[:8] + "..." if len(user_key) > 8 else user_key,
+        "key": user_key,
         "method": method,
         "path": path,
     }
