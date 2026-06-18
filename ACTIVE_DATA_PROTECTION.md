@@ -447,7 +447,19 @@ HTTP route
 
 ```text
 POST /v1/messages      -> protected_model_egress
+POST /api/generate     -> protected_model_egress
+POST /api/chat         -> protected_model_egress
+POST /api/embed        -> protected_model_egress
 GET  /v1/models        -> metadata_only
+GET  /api/tags         -> metadata_only
+GET  /api/ps           -> metadata_only
+GET  /api/version      -> metadata_only
+POST /api/show         -> metadata_only
+POST /api/create       -> denied_admin
+POST /api/copy         -> denied_admin
+POST /api/pull         -> denied_admin
+POST /api/push         -> denied_admin
+DELETE /api/delete     -> denied_admin
 GET  /metrics          -> no_upstream_content
 GET  /health           -> health
 ANY  /{path}           -> denied by default or classified allowlist
@@ -1246,10 +1258,18 @@ Outputs:
 - initial action matrix;
 - policy file schema.
 
-Decisions to make:
+Decisions made in the native Ollama allowlist increment:
 
-- whether catch-all stays;
-- whether Ollama non-Anthropic model routes are supported;
+- catch-all stays only as authenticated deny-by-default;
+- Ollama non-Anthropic model routes are supported only through explicit allowlist:
+  `/api/generate`, `/api/chat`, `/api/embed`;
+- native Ollama metadata routes are allowlisted:
+  `/api/tags`, `/api/ps`, `/api/version`, `/api/show`;
+- native Ollama admin/model-management routes are denied:
+  `/api/create`, `/api/copy`, `/api/pull`, `/api/push`, `/api/delete`;
+
+Open decisions:
+
 - how model names map to `local_model` or `cloud_model`;
 - what to do with unknown destination and unsupported shapes.
 

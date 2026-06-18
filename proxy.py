@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-aproxy — Anthropic-compatible reverse proxy for Ollama.
+aproxy — authenticated reverse proxy for Ollama.
 Provides token authentication and usage audit while passing
-requests through to Ollama's native /v1/messages endpoint.
+Anthropic-compatible and allowlisted native Ollama API requests upstream.
 
 Listens on port 4001. Authenticated users are validated against
 a static key file (keys.json).
 
 Architecture:
-  Claude Code -> :4001 (aproxy) -> :11434 (Ollama)
+  Claude Code / Ollama clients -> :4001 (aproxy) -> :11434 (Ollama)
 
 Claude Code sends auth via:
   1. x-api-key header
@@ -18,6 +18,8 @@ When both are present, x-api-key takes priority for user identification.
 All tokens are validated against keys.json -- no bypass or fallback.
 """
 
+import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -32,7 +34,7 @@ from datetime import datetime, timezone
 import httpx
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse, Response
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 
 # --- Server configuration ---
@@ -376,12 +378,15 @@ async def lifespan(app: FastAPI):
     )
     log.info(f"httpx client ready for Ollama at {OLLAMA_BASE}")
     try:
-        r = await client.get("/api/tags")
-        if r.status_code == 200:
-            AVAILABLE_OLLAMA_MODELS = {m.get("name", "") for m in r.json().get("models", [])}
-            log.info(f"Discovered {len(AVAILABLE_OLLAMA_MODELS)} Ollama models")
-        else:
-            log.warning(f"Could not fetch Ollama model list: {r.status_code}")
+        try:
+            r = await client.get("/api/tags", timeout=2.0)
+            if r.status_code == 200:
+                AVAILABLE_OLLAMA_MODELS = {m.get("name", "") for m in r.json().get("models", [])}
+                log.info(f"Discovered {len(AVAILABLE_OLLAMA_MODELS)} Ollama models")
+            else:
+                log.warning(f"Could not fetch Ollama model list: {r.status_code}")
+        except Exception as e:
+            log.warning(f"Could not fetch Ollama model list: {e}")
         yield
     finally:
         await client.aclose()
@@ -396,6 +401,25 @@ def make_error(status_code: int, error_type: str, message: str) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
         content={"type": "error", "error": {"type": error_type, "message": message}},
+    )
+
+
+def make_ollama_error(status_code: int, message: str) -> JSONResponse:
+    """Return an Ollama-style JSON error response."""
+    return JSONResponse(status_code=status_code, content={"error": message})
+
+
+def native_ollama_auth_error_message(api_key: str | None) -> str:
+    """Return a native Ollama client friendly authentication error."""
+    if api_key:
+        return (
+            "Invalid aproxy token for native Ollama API. "
+            "Check the API key configured in your Ollama client or the token embedded in the base URL."
+        )
+    return (
+        "Authentication required for native Ollama API. "
+        "Configure your Ollama client to send an aproxy token via Authorization: Bearer <token>, "
+        "x-api-key, or HTTP Basic credentials in the base URL."
     )
 
 
@@ -430,8 +454,104 @@ def _merge_stream_usage_from_line(line: str, total_tokens: dict):
     _merge_usage(total_tokens, event.get("usage"))
 
 
+def _json_or_empty(body: bytes) -> dict:
+    """Parse a JSON request/response body for analytics without changing forwarding."""
+    if not body:
+        return {}
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _ollama_native_tokens(data: dict) -> dict | None:
+    """Convert native Ollama usage fields into aproxy token counters."""
+    tokens = {}
+    if isinstance(data.get("prompt_eval_count"), int):
+        tokens["input_tokens"] = data["prompt_eval_count"]
+    if isinstance(data.get("eval_count"), int):
+        tokens["output_tokens"] = data["eval_count"]
+    return tokens or None
+
+
+def _merge_ollama_native_usage_from_line(line: str, total_tokens: dict):
+    """Extract native Ollama usage fields from one NDJSON line."""
+    try:
+        data = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    tokens = _ollama_native_tokens(data)
+    if tokens:
+        total_tokens.update(tokens)
+
+
+_OLLAMA_MODEL_ROUTES = {
+    ("POST", "/api/generate"),
+    ("POST", "/api/chat"),
+    ("POST", "/api/embed"),
+}
+_OLLAMA_METADATA_ROUTES = {
+    ("GET", "/api/tags"),
+    ("GET", "/api/ps"),
+    ("GET", "/api/version"),
+    ("POST", "/api/show"),
+}
+_OLLAMA_ADMIN_ROUTES = {
+    ("POST", "/api/create"),
+    ("POST", "/api/copy"),
+    ("POST", "/api/pull"),
+    ("POST", "/api/push"),
+    ("DELETE", "/api/delete"),
+}
+_OLLAMA_ADMIN_PATHS = {path for _, path in _OLLAMA_ADMIN_ROUTES}
+_OLLAMA_STREAMING_MODEL_PATHS = {"/api/generate", "/api/chat"}
+
+
+def _classify_ollama_route(method: str, path: str) -> str:
+    """Classify native Ollama routes before any upstream forwarding."""
+    key = (method.upper(), path)
+    if key in _OLLAMA_MODEL_ROUTES:
+        return "model_egress"
+    if key in _OLLAMA_METADATA_ROUTES:
+        return "metadata"
+    if key in _OLLAMA_ADMIN_ROUTES:
+        return "admin_blocked"
+    return "unsupported"
+
+
+def _ollama_should_stream(path: str, body_json: dict) -> bool:
+    """Native Ollama generate/chat stream by default unless stream is false."""
+    return path in _OLLAMA_STREAMING_MODEL_PATHS and body_json.get("stream", True) is not False
+
+
+def _upstream_target(request: Request, path: str) -> str:
+    query = request.url.query
+    return f"{path}?{query}" if query else path
+
+
+def _ollama_headers(request: Request) -> dict:
+    headers = {"Authorization": "Bearer ollama"}
+    for h in ("accept", "content-type"):
+        v = request.headers.get(h)
+        if v:
+            headers[h] = v
+    return headers
+
+
+def _response_from_upstream(resp: httpx.Response) -> Response:
+    headers = {}
+    content_type = resp.headers.get("content-type")
+    if content_type:
+        headers["content-type"] = content_type
+    return Response(content=resp.content, status_code=resp.status_code, headers=headers)
+
+
 def audit(user_key: str, method: str, path: str, model: str | None = None,
-          status: int | None = None, tokens: dict | None = None, error: str | None = None):
+          status: int | None = None, tokens: dict | None = None, error: str | None = None,
+          api_family: str | None = None, route_class: str | None = None):
     """Write audit record and update Prometheus metrics."""
     if tokens and model:
         inp = tokens.get("input_tokens", 0)
@@ -450,6 +570,10 @@ def audit(user_key: str, method: str, path: str, model: str | None = None,
     }
     if model:
         record["model"] = model
+    if api_family:
+        record["api_family"] = api_family
+    if route_class:
+        record["route_class"] = route_class
     if status:
         record["status"] = status
     if tokens:
@@ -464,6 +588,31 @@ def audit(user_key: str, method: str, path: str, model: str | None = None,
         log.warning(f"Audit write failed: {e}")
 
 
+def _extract_basic_auth_token(value: str) -> str | None:
+    """Extract an aproxy token from HTTP Basic credentials.
+
+    Some native Ollama clients do not expose custom headers, but they do accept
+    credentials embedded into the base URL, for example:
+      http://sk-token@host:4001
+      http://user:sk-token@host:4001
+
+    HTTP clients send those as Authorization: Basic base64("user:password").
+    Treat password as the token when present, otherwise use username.
+    """
+    try:
+        decoded = base64.b64decode(value, validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return value.strip() or None
+
+    if ":" not in decoded:
+        return decoded.strip() or None
+
+    username, password = decoded.split(":", 1)
+    if password.strip():
+        return password.strip()
+    return username.strip() or None
+
+
 def extract_api_key(x_api_key: str | None, authorization: str | None) -> str | None:
     """Extract API key from x-api-key or Authorization header.
     
@@ -476,7 +625,7 @@ def extract_api_key(x_api_key: str | None, authorization: str | None) -> str | N
         if authorization.startswith("Bearer "):
             return authorization[7:].strip()
         if authorization.startswith("Basic "):
-            return authorization[6:].strip()
+            return _extract_basic_auth_token(authorization[6:].strip())
     return None
 
 
@@ -544,10 +693,15 @@ async def add_cors_and_timing(request: Request, call_next):
         raise
     elapsed = time.time() - start
 
-    # Detect SSE by content-type header. Starlette's internal _StreamingResponse
-    # may have media_type=None; the real type is only in response headers.
+    # Detect streaming responses by content-type header. Starlette's internal
+    # _StreamingResponse may have media_type=None; the real type is only in
+    # response headers.
     ct = response.headers.get("content-type", "")
-    is_streaming = ct.startswith("text/event-stream")
+    is_streaming = (
+        getattr(request.state, "streaming_response", False)
+        or ct.startswith("text/event-stream")
+        or ct.startswith("application/x-ndjson")
+    )
 
     if is_streaming:
         # For SSE, metrics and gauge are managed by the stream generator:
@@ -595,12 +749,18 @@ async def add_cors_and_timing(request: Request, call_next):
 _KNOWN_PATHS = {
     "/v1/messages", "/v1/models", "/v1/organizations",
     "/v1/messages/batches",
+    "/api/generate", "/api/chat", "/api/embed", "/api/tags",
+    "/api/ps", "/api/version", "/api/show",
 }
 
 def _normalize_path(path: str) -> str:
     """Normalize URL path to a fixed set of buckets for metrics labels."""
     if path in _KNOWN_PATHS:
         return path
+    if path in _OLLAMA_ADMIN_PATHS:
+        return "/api/admin"
+    if path.startswith("/api/"):
+        return "/api/other"
     if path.startswith("/v1/"):
         return "/v1/other"
     return "/other"
@@ -714,8 +874,6 @@ async def messages(request: Request, x_api_key: str | None = Header(None),
         headers["anthropic-beta"] = ab
 
     log.info(f"[{user}] POST /v1/messages model={model} (requested={requested_model}) stream={stream}")
-    if os.environ.get("APROXY_DEBUG_BODY"):
-        log.info(f"[{user}] request body: {body.decode('utf-8', errors='replace')[:4000]}")
 
     try:
         if stream:
@@ -732,8 +890,6 @@ async def messages(request: Request, x_api_key: str | None = Header(None),
                     tokens = resp_body["usage"]
             else:
                 log.warning(f"[{user}] Ollama error {r.status_code}: {r.text[:500]}")
-                if os.environ.get("APROXY_DEBUG_BODY"):
-                    log.info(f"[{user}] Ollama error body: {r.text[:4000]}")
                 error_text = r.text[:200]
 
             audit(user, "POST", "/v1/messages", model=model, status=r.status_code, tokens=tokens, error=error_text)
@@ -837,6 +993,7 @@ async def _stream_response(request: Request, http_client, user: str, model: str,
                     }
                     yield f"event: error\ndata: {json.dumps(error_event)}\n\n"
 
+        request.state.streaming_response = True
         return StreamingResponse(generate(), media_type="text/event-stream")
 
     except httpx.ReadTimeout:
@@ -849,6 +1006,251 @@ async def _stream_response(request: Request, http_client, user: str, model: str,
         request.state.stream_status = 500
         audit(user, "POST", "/v1/messages", model=model, status=500, error=str(e))
         return make_error(500, "api_error", f"Stream error: {e}")
+
+
+async def _ollama_native_response(
+    request: Request,
+    http_client,
+    user: str,
+    path: str,
+    route_class: str,
+    model: str | None,
+    body: bytes,
+    headers: dict,
+):
+    """Proxy a non-streaming native Ollama request and record audit usage."""
+    target = _upstream_target(request, path)
+    resp = await http_client.request(request.method, target, content=body, headers=headers)
+
+    tokens = None
+    error_text = None
+    if route_class == "model_egress" and resp.status_code == 200:
+        content_type = resp.headers.get("content-type", "")
+        if content_type.startswith("application/json"):
+            try:
+                tokens = _ollama_native_tokens(resp.json())
+            except (json.JSONDecodeError, ValueError):
+                tokens = None
+    elif resp.status_code >= 400:
+        error_text = resp.text[:200]
+
+    audit(
+        user,
+        request.method,
+        path,
+        model=model,
+        status=resp.status_code,
+        tokens=tokens,
+        error=error_text,
+        api_family="ollama",
+        route_class=route_class,
+    )
+    return _response_from_upstream(resp)
+
+
+async def _ollama_native_stream_response(
+    request: Request,
+    http_client,
+    user: str,
+    path: str,
+    route_class: str,
+    model: str | None,
+    body: bytes,
+    headers: dict,
+):
+    """Stream native Ollama NDJSON while extracting final usage fields."""
+    request.state.stream_status = 500
+    target = _upstream_target(request, path)
+
+    try:
+        stream_cm = http_client.stream(request.method, target, content=body, headers=headers)
+        resp = await stream_cm.__aenter__()
+        request.state.stream_status = resp.status_code
+
+        if resp.status_code != 200:
+            try:
+                error_body = await resp.aread()
+            finally:
+                await stream_cm.__aexit__(None, None, None)
+            error_text = error_body.decode("utf-8", errors="replace")
+            audit(
+                user,
+                request.method,
+                path,
+                model=model,
+                status=resp.status_code,
+                error=error_text[:200],
+                api_family="ollama",
+                route_class=route_class,
+            )
+            content_type = resp.headers.get("content-type", "application/json")
+            return Response(
+                content=error_body,
+                status_code=resp.status_code,
+                headers={"content-type": content_type},
+            )
+
+        total_tokens = {}
+
+        async def generate():
+            stream_broken = False
+            yielded_any = False
+            try:
+                async for line in resp.aiter_lines():
+                    yielded_any = True
+                    yield line + "\n"
+                    _merge_ollama_native_usage_from_line(line, total_tokens)
+            except httpx.StreamClosed:
+                stream_broken = True
+                if yielded_any:
+                    log.warning(f"[{user}] Ollama closed native stream unexpectedly after partial data")
+                else:
+                    log.error(f"[{user}] Ollama closed native stream unexpectedly before any data")
+            except Exception as e:
+                stream_broken = True
+                if yielded_any:
+                    log.warning(f"[{user}] native Ollama stream error after partial data: {e}")
+                else:
+                    log.error(f"[{user}] Error while streaming from native Ollama route {path}: {e}")
+            finally:
+                status = 200 if not stream_broken else 500
+                request.state.stream_status = status
+                error_msg = None
+                if stream_broken:
+                    error_msg = "stream closed by Ollama"
+                audit(
+                    user,
+                    request.method,
+                    path,
+                    model=model,
+                    status=status,
+                    tokens=total_tokens if total_tokens else None,
+                    error=error_msg,
+                    api_family="ollama",
+                    route_class=route_class,
+                )
+                try:
+                    await stream_cm.__aexit__(None, None, None)
+                except Exception as e:
+                    log.warning(f"[{user}] error closing native Ollama stream: {e}")
+                if stream_broken:
+                    yield json.dumps({"error": "Ollama closed the stream unexpectedly."}) + "\n"
+
+        request.state.streaming_response = True
+        content_type = resp.headers.get("content-type", "application/x-ndjson")
+        return StreamingResponse(generate(), media_type=content_type)
+
+    except httpx.ReadTimeout:
+        log.error(f"[{user}] Native Ollama stream timeout for {path}")
+        request.state.stream_status = 504
+        audit(
+            user,
+            request.method,
+            path,
+            model=model,
+            status=504,
+            error="stream timeout",
+            api_family="ollama",
+            route_class=route_class,
+        )
+        return make_ollama_error(504, "Ollama stream timed out")
+    except Exception as e:
+        log.error(f"[{user}] Native Ollama stream error for {path}: {e}", exc_info=True)
+        request.state.stream_status = 500
+        audit(
+            user,
+            request.method,
+            path,
+            model=model,
+            status=500,
+            error=str(e),
+            api_family="ollama",
+            route_class=route_class,
+        )
+        return make_ollama_error(500, f"Ollama proxy stream error: {e}")
+
+
+@app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def ollama_api(request: Request, path: str, x_api_key: str | None = Header(None),
+                     authorization: str | None = Header(None)):
+    """Allowlisted native Ollama API proxy with aproxy authentication and audit."""
+    api_path = f"/api/{path}"
+    api_key = extract_api_key(x_api_key, authorization)
+    try:
+        user = await validate_key_async(api_key, request)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+        if exc.status_code == 401:
+            return make_ollama_error(exc.status_code, native_ollama_auth_error_message(api_key))
+        return make_ollama_error(exc.status_code, detail.get("message", "Authentication failed"))
+
+    route_class = _classify_ollama_route(request.method, api_path)
+    if route_class == "admin_blocked":
+        audit(
+            user,
+            request.method,
+            api_path,
+            status=403,
+            error="native Ollama admin route is disabled",
+            api_family="ollama",
+            route_class=route_class,
+        )
+        return make_ollama_error(403, "This Ollama API route is disabled by aproxy policy")
+    if route_class == "unsupported":
+        audit(
+            user,
+            request.method,
+            api_path,
+            status=404,
+            error="unsupported native Ollama API route",
+            api_family="ollama",
+            route_class=route_class,
+        )
+        return make_ollama_error(404, "Unsupported Ollama API route")
+
+    body = await request.body() if request.method in {"POST", "PUT", "PATCH"} else b""
+    body_json = _json_or_empty(body)
+    model = body_json.get("model") if isinstance(body_json.get("model"), str) else None
+    headers = _ollama_headers(request)
+
+    log.info(f"[{user}] {request.method} {api_path} route_class={route_class} model={model or '-'}")
+
+    try:
+        if route_class == "model_egress" and _ollama_should_stream(api_path, body_json):
+            return await _ollama_native_stream_response(
+                request, http_client=client, user=user, path=api_path,
+                route_class=route_class, model=model, body=body, headers=headers,
+            )
+        return await _ollama_native_response(
+            request, http_client=client, user=user, path=api_path,
+            route_class=route_class, model=model, body=body, headers=headers,
+        )
+    except httpx.ReadTimeout:
+        log.error(f"[{user}] Native Ollama request timeout for {api_path}")
+        audit(
+            user,
+            request.method,
+            api_path,
+            model=model,
+            status=504,
+            error="timeout",
+            api_family="ollama",
+            route_class=route_class,
+        )
+        return make_ollama_error(504, "Ollama request timed out")
+    except Exception as e:
+        log.error(f"[{user}] Native Ollama proxy error for {api_path}: {e}", exc_info=True)
+        audit(
+            user,
+            request.method,
+            api_path,
+            model=model,
+            status=500,
+            error=str(e),
+            api_family="ollama",
+            route_class=route_class,
+        )
+        return make_ollama_error(500, f"Ollama proxy error: {e}")
 
 
 @app.post("/v1/messages/batches")
@@ -880,30 +1282,17 @@ async def org_users(org_id: str, request: Request, x_api_key: str | None = Heade
     return {"data": [], "has_more": False}
 
 
-# --- Catch-all: proxy unrecognised paths to Ollama with auth ---
+# --- Catch-all: reject unrecognised paths after auth ---
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def catch_all(request: Request, path: str, x_api_key: str | None = Header(None),
                      authorization: str | None = Header(None)):
-    """Proxy any unmatched paths to Ollama with authentication."""
+    """Reject unmatched paths so model-capable traffic cannot bypass allowlists."""
     api_key = extract_api_key(x_api_key, authorization)
     user = await validate_key_async(api_key, request)
-    audit(user, request.method, f"/{path}")
-
-    # Build headers for Ollama
-    headers = {"Authorization": "Bearer ollama"}
-    for h in ["anthropic-version", "anthropic-beta", "content-type"]:
-        v = request.headers.get(h)
-        if v:
-            headers[h] = v
-
-    try:
-        r = await client.request(request.method, f"/{path}", content=await request.body(), headers=headers)
-        return JSONResponse(status_code=r.status_code, content=r.json() if r.headers.get("content-type", "").startswith("application/json") else {"data": r.text})
-    except Exception as e:
-        log.error(f"[{user}] Catch-all proxy error for /{path}: {e}")
-        return make_error(502, "api_error", f"Ollama proxy error: {e}")
+    audit(user, request.method, f"/{path}", status=404, error="unsupported route")
+    return make_error(404, "not_found", "Unsupported API route")
 
 
 if __name__ == "__main__":
