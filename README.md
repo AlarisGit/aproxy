@@ -3,6 +3,8 @@
 Reverse proxy между AI-агентами и Ollama. Добавляет аутентификацию по токенам,
 аудит запросов и метрики использования, сохраняя Anthropic Messages API
 совместимость для Claude Code и allowlisted native Ollama API для других агентов.
+Исключение: `GET /api/tags` доступен без обязательной аутентификации, чтобы
+native Ollama клиенты могли загрузить список моделей для model picker.
 
 ```
 Claude Code      → :4001 (aproxy, auth + audit) → :11434 (Ollama /v1/messages)
@@ -92,7 +94,7 @@ Native Ollama allowlist:
 - `POST /api/generate` — генерация, streaming NDJSON поддерживается
 - `POST /api/chat` — чат, streaming NDJSON поддерживается
 - `POST /api/embed` — embeddings
-- `GET /api/tags` — список моделей
+- `GET /api/tags` — список моделей, public metadata exception для model picker
 - `GET /api/ps` — загруженные/активные модели
 - `GET /api/version` — версия Ollama
 - `POST /api/show` — метаданные модели
@@ -471,7 +473,7 @@ tail -f /var/log/aproxy/audit.jsonl
 - `method` / `path` — HTTP метод и путь
 - `model` — фактическая upstream-модель после server-side mapping (если есть)
 - `api_family` — `anthropic`/отсутствует для Anthropic-compatible routes, `ollama` для native Ollama routes
-- `route_class` — классификация native Ollama route (`model_egress`, `metadata`, `admin_blocked`, `unsupported`)
+- `route_class` — классификация native Ollama route (`model_egress`, `metadata`, `public_metadata`, `admin_blocked`, `unsupported`)
 - `status` — HTTP статус ответа upstream или итоговый статус streaming-запроса (если есть)
 - `tokens` — использование токенов из upstream `usage` (если доступно)
 - `error` — текст ошибки (если есть)
@@ -490,6 +492,11 @@ Prometheus request metrics как `user="anonymous"`.
 streaming `/api/generate` и `/api/chat` usage берётся из финального NDJSON chunk
 с `done: true`. Если клиент оборвал поток до финального chunk, токены могут быть
 неполными или отсутствовать.
+
+`GET /api/tags` является public metadata exception: без токена или с невалидным
+токеном запрос проксируется в Ollama и аудируется как `key="anonymous"` с
+`route_class="public_metadata"`. Если валидный токен всё же передан, audit
+привязывает запрос к соответствующему пользователю.
 
 Ротируется logrotate (30 дней).
 
@@ -604,12 +611,16 @@ curl -s http://127.0.0.1:4001/v1/models | python3 -m json.tool
 curl -s -H "Authorization: Bearer wrong-token" http://127.0.0.1:4001/v1/models | python3 -m json.tool
 # {"type":"error","error":{"type":"authentication_error","message":"Invalid authentication token..."}}
 
-# Native Ollama API без токена (должно вернуть 401 без упоминания Anthropic)
+# Native model list для Cline model picker: public metadata exception
 curl -s http://127.0.0.1:4001/api/tags | python3 -m json.tool
+# {"models":[...]}
+
+# Protected native Ollama API без токена (должно вернуть 401 без упоминания Anthropic)
+curl -s http://127.0.0.1:4001/api/version | python3 -m json.tool
 # {"error":"Authentication required for native Ollama API..."}
 
-# Native Ollama API с неверным токеном
-curl -s -H "Authorization: Bearer wrong-token" http://127.0.0.1:4001/api/tags | python3 -m json.tool
+# Protected native Ollama API с неверным токеном
+curl -s -H "Authorization: Bearer wrong-token" http://127.0.0.1:4001/api/version | python3 -m json.tool
 # {"error":"Invalid aproxy token for native Ollama API..."}
 
 # Проверить аутентификацию — с правильным токеном
@@ -844,6 +855,11 @@ http://aproxy:<token>@192.168.2.150:4001
 
 aproxy принимает оба варианта: токен в username или токен в password.
 
+Cline загружает список моделей через `GET /api/tags` без передачи API key. Этот
+маршрут намеренно разрешён как public metadata exception, поэтому dropdown
+моделей работает без отдельной настройки. Модельные запросы (`/api/chat`,
+`/api/generate`, `/api/embed`) всё равно требуют персональный токен.
+
 Поддерживаются только рабочие маршруты:
 
 ```text
@@ -855,6 +871,9 @@ GET  /api/ps
 GET  /api/version
 POST /api/show
 ```
+
+Из этих маршрутов только `GET /api/tags` доступен без обязательной
+аутентификации. Остальные metadata и model routes требуют токен.
 
 Управление моделями через native API намеренно отключено: `/api/create`,
 `/api/copy`, `/api/pull`, `/api/push`, `/api/delete` возвращают 403 и не доходят

@@ -451,7 +451,7 @@ POST /api/generate     -> protected_model_egress
 POST /api/chat         -> protected_model_egress
 POST /api/embed        -> protected_model_egress
 GET  /v1/models        -> metadata_only
-GET  /api/tags         -> metadata_only
+GET  /api/tags         -> public_metadata
 GET  /api/ps           -> metadata_only
 GET  /api/version      -> metadata_only
 POST /api/show         -> metadata_only
@@ -468,7 +468,9 @@ ANY  /{path}           -> denied by default or classified allowlist
 Если catch-all остается, ему нужна policy:
 
 ```text
-if route is known metadata:
+if route is public metadata:
+    forward metadata without mandatory authentication
+elif route is known metadata:
     forward metadata
 elif route is known model egress:
     protection pipeline
@@ -1263,8 +1265,10 @@ Decisions made in the native Ollama allowlist increment:
 - catch-all stays only as authenticated deny-by-default;
 - Ollama non-Anthropic model routes are supported only through explicit allowlist:
   `/api/generate`, `/api/chat`, `/api/embed`;
+- `GET /api/tags` is a public metadata exception for native Ollama model pickers
+  such as Cline; unauthenticated requests are audited as `anonymous`;
 - native Ollama metadata routes are allowlisted:
-  `/api/tags`, `/api/ps`, `/api/version`, `/api/show`;
+  `/api/ps`, `/api/version`, `/api/show`;
 - native Ollama admin/model-management routes are denied:
   `/api/create`, `/api/copy`, `/api/pull`, `/api/push`, `/api/delete`;
 

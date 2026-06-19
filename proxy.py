@@ -499,6 +499,9 @@ _OLLAMA_METADATA_ROUTES = {
     ("GET", "/api/version"),
     ("POST", "/api/show"),
 }
+_OLLAMA_PUBLIC_METADATA_ROUTES = {
+    ("GET", "/api/tags"),
+}
 _OLLAMA_ADMIN_ROUTES = {
     ("POST", "/api/create"),
     ("POST", "/api/copy"),
@@ -513,6 +516,8 @@ _OLLAMA_STREAMING_MODEL_PATHS = {"/api/generate", "/api/chat"}
 def _classify_ollama_route(method: str, path: str) -> str:
     """Classify native Ollama routes before any upstream forwarding."""
     key = (method.upper(), path)
+    if key in _OLLAMA_PUBLIC_METADATA_ROUTES:
+        return "public_metadata"
     if key in _OLLAMA_MODEL_ROUTES:
         return "model_egress"
     if key in _OLLAMA_METADATA_ROUTES:
@@ -1175,16 +1180,26 @@ async def ollama_api(request: Request, path: str, x_api_key: str | None = Header
                      authorization: str | None = Header(None)):
     """Allowlisted native Ollama API proxy with aproxy authentication and audit."""
     api_path = f"/api/{path}"
-    api_key = extract_api_key(x_api_key, authorization)
-    try:
-        user = await validate_key_async(api_key, request)
-    except HTTPException as exc:
-        detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
-        if exc.status_code == 401:
-            return make_ollama_error(exc.status_code, native_ollama_auth_error_message(api_key))
-        return make_ollama_error(exc.status_code, detail.get("message", "Authentication failed"))
-
     route_class = _classify_ollama_route(request.method, api_path)
+    api_key = extract_api_key(x_api_key, authorization)
+
+    if route_class == "public_metadata":
+        user = "anonymous"
+        request.state.user = user
+        if api_key:
+            try:
+                user = await validate_key_async(api_key, request)
+            except HTTPException:
+                request.state.user = "anonymous"
+    else:
+        try:
+            user = await validate_key_async(api_key, request)
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+            if exc.status_code == 401:
+                return make_ollama_error(exc.status_code, native_ollama_auth_error_message(api_key))
+            return make_ollama_error(exc.status_code, detail.get("message", "Authentication failed"))
+
     if route_class == "admin_blocked":
         audit(
             user,

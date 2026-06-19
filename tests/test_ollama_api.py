@@ -82,6 +82,15 @@ class TestOllamaNativeAuthAndPolicy:
         assert "ANTHROPIC_AUTH_TOKEN" not in message
 
     @pytest.mark.asyncio
+    async def test_native_ollama_keeps_non_public_metadata_authenticated(self, native_client):
+        response = await native_client.get("/api/version")
+
+        assert response.status_code == 401
+        message = response.json()["error"]
+        assert "native Ollama API" in message
+        assert "ANTHROPIC_AUTH_TOKEN" not in message
+
+    @pytest.mark.asyncio
     async def test_native_ollama_reports_invalid_aproxy_token(self, native_client):
         response = await native_client.post(
             "/api/chat",
@@ -170,6 +179,59 @@ class TestOllamaNativeAuthAndPolicy:
 
 
 class TestOllamaNativeProxy:
+    @pytest.mark.asyncio
+    async def test_tags_allows_anonymous_model_listing(self, native_client, monkeypatch):
+        audit_records = []
+        upstream = _FakeRequestClient(httpx.Response(200, json={"models": [{"name": "test"}]}))
+        monkeypatch.setattr(proxy, "audit", lambda *args, **kwargs: audit_records.append((args, kwargs)))
+        monkeypatch.setattr(proxy, "client", upstream, raising=False)
+
+        response = await native_client.get("/api/tags")
+
+        assert response.status_code == 200
+        assert response.json() == {"models": [{"name": "test"}]}
+        assert upstream.calls[0]["method"] == "GET"
+        assert upstream.calls[0]["target"] == "/api/tags"
+        assert len(audit_records) == 1
+        assert audit_records[0][0][:3] == ("anonymous", "GET", "/api/tags")
+        assert audit_records[0][1]["status"] == 200
+        assert audit_records[0][1]["api_family"] == "ollama"
+        assert audit_records[0][1]["route_class"] == "public_metadata"
+
+    @pytest.mark.asyncio
+    async def test_tags_ignores_invalid_auth_and_audits_anonymous(self, native_client, monkeypatch):
+        audit_records = []
+        upstream = _FakeRequestClient(httpx.Response(200, json={"models": [{"name": "test"}]}))
+        monkeypatch.setattr(proxy, "audit", lambda *args, **kwargs: audit_records.append((args, kwargs)))
+        monkeypatch.setattr(proxy, "client", upstream, raising=False)
+
+        response = await native_client.get(
+            "/api/tags",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"models": [{"name": "test"}]}
+        assert len(audit_records) == 1
+        assert audit_records[0][0][:3] == ("anonymous", "GET", "/api/tags")
+        assert audit_records[0][1]["route_class"] == "public_metadata"
+
+    @pytest.mark.asyncio
+    async def test_tags_uses_authenticated_user_when_valid_auth_is_present(
+        self, native_client, auth_headers, monkeypatch
+    ):
+        audit_records = []
+        upstream = _FakeRequestClient(httpx.Response(200, json={"models": [{"name": "test"}]}))
+        monkeypatch.setattr(proxy, "audit", lambda *args, **kwargs: audit_records.append((args, kwargs)))
+        monkeypatch.setattr(proxy, "client", upstream, raising=False)
+
+        response = await native_client.get("/api/tags", headers=auth_headers)
+
+        assert response.status_code == 200
+        assert len(audit_records) == 1
+        assert audit_records[0][0][:3] == ("tester", "GET", "/api/tags")
+        assert audit_records[0][1]["route_class"] == "public_metadata"
+
     @pytest.mark.asyncio
     async def test_metadata_route_proxies_query_and_audits_status(
         self, native_client, auth_headers, monkeypatch
