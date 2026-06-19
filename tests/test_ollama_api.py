@@ -10,12 +10,15 @@ import pytest_asyncio
 import proxy
 
 
+TEST_CLIENT_IP = "203.0.113.10"
+
+
 @pytest_asyncio.fixture
 async def native_client(monkeypatch, authenticated_key_store):
     """ASGI client without app lifespan, so tests do not require a real Ollama."""
     monkeypatch.setattr(proxy, "_key_store", authenticated_key_store)
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=proxy.app),
+        transport=httpx.ASGITransport(app=proxy.app, client=(TEST_CLIENT_IP, 12345)),
         base_url="http://testserver",
     ) as client:
         yield client
@@ -180,7 +183,9 @@ class TestOllamaNativeAuthAndPolicy:
 
 class TestOllamaNativeProxy:
     @pytest.mark.asyncio
-    async def test_tags_allows_anonymous_model_listing(self, native_client, monkeypatch):
+    async def test_tags_uses_client_ip_for_unauthenticated_model_listing(
+        self, native_client, monkeypatch
+    ):
         audit_records = []
         upstream = _FakeRequestClient(httpx.Response(200, json={"models": [{"name": "test"}]}))
         monkeypatch.setattr(proxy, "audit", lambda *args, **kwargs: audit_records.append((args, kwargs)))
@@ -193,13 +198,13 @@ class TestOllamaNativeProxy:
         assert upstream.calls[0]["method"] == "GET"
         assert upstream.calls[0]["target"] == "/api/tags"
         assert len(audit_records) == 1
-        assert audit_records[0][0][:3] == ("anonymous", "GET", "/api/tags")
+        assert audit_records[0][0][:3] == (TEST_CLIENT_IP, "GET", "/api/tags")
         assert audit_records[0][1]["status"] == 200
         assert audit_records[0][1]["api_family"] == "ollama"
         assert audit_records[0][1]["route_class"] == "public_metadata"
 
     @pytest.mark.asyncio
-    async def test_tags_ignores_invalid_auth_and_audits_anonymous(self, native_client, monkeypatch):
+    async def test_tags_ignores_invalid_auth_and_audits_client_ip(self, native_client, monkeypatch):
         audit_records = []
         upstream = _FakeRequestClient(httpx.Response(200, json={"models": [{"name": "test"}]}))
         monkeypatch.setattr(proxy, "audit", lambda *args, **kwargs: audit_records.append((args, kwargs)))
@@ -213,7 +218,7 @@ class TestOllamaNativeProxy:
         assert response.status_code == 200
         assert response.json() == {"models": [{"name": "test"}]}
         assert len(audit_records) == 1
-        assert audit_records[0][0][:3] == ("anonymous", "GET", "/api/tags")
+        assert audit_records[0][0][:3] == (TEST_CLIENT_IP, "GET", "/api/tags")
         assert audit_records[0][1]["route_class"] == "public_metadata"
 
     @pytest.mark.asyncio
@@ -231,6 +236,42 @@ class TestOllamaNativeProxy:
         assert len(audit_records) == 1
         assert audit_records[0][0][:3] == ("tester", "GET", "/api/tags")
         assert audit_records[0][1]["route_class"] == "public_metadata"
+
+    def test_public_tags_audit_suppresses_repeated_ip_entries(self, tmp_path, monkeypatch):
+        audit_log = tmp_path / "audit.jsonl"
+        now = {"value": 1000.0}
+        monkeypatch.setattr(proxy, "AUDIT_LOG", str(audit_log))
+        monkeypatch.setattr(proxy, "AUDIT_ENABLED", True)
+        monkeypatch.setattr(proxy, "PUBLIC_TAGS_LOG_SUPPRESS_SECONDS", 600.0)
+        monkeypatch.setattr(proxy.time, "time", lambda: now["value"])
+
+        proxy._PUBLIC_TAGS_LOG_LAST.clear()
+        try:
+            for _ in range(3):
+                proxy.audit(
+                    TEST_CLIENT_IP,
+                    "GET",
+                    "/api/tags",
+                    status=200,
+                    api_family="ollama",
+                    route_class="public_metadata",
+                )
+            now["value"] += 601.0
+            proxy.audit(
+                TEST_CLIENT_IP,
+                "GET",
+                "/api/tags",
+                status=200,
+                api_family="ollama",
+                route_class="public_metadata",
+            )
+        finally:
+            proxy._PUBLIC_TAGS_LOG_LAST.clear()
+
+        records = [json.loads(line) for line in audit_log.read_text().splitlines()]
+        assert len(records) == 2
+        assert [record["key"] for record in records] == [TEST_CLIENT_IP, TEST_CLIENT_IP]
+        assert all(record["route_class"] == "public_metadata" for record in records)
 
     @pytest.mark.asyncio
     async def test_metadata_route_proxies_query_and_audits_status(

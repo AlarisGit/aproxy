@@ -57,6 +57,7 @@ def _load_config(path: str) -> dict:
         "proxy_log": "/var/log/aproxy/proxy.log",
         "max_body_size": 50 * 1024 * 1024,
         "key_reload_interval": 1.0,
+        "public_tags_log_suppress_seconds": 600.0,
     }
     try:
         with open(path) as f:
@@ -326,6 +327,13 @@ def validate_key(api_key: str | None) -> str:
 # Audit log
 AUDIT_LOG = CONFIG["audit_log"]
 AUDIT_ENABLED = bool(AUDIT_LOG)
+PUBLIC_TAGS_LOG_SUPPRESS_SECONDS = float(
+    CONFIG.get(
+        "public_tags_log_suppress_seconds",
+        CONFIG.get("public_tags_audit_suppress_seconds", 600.0),
+    )
+)
+_PUBLIC_TAGS_LOG_LAST: dict[tuple[str, str, str, str, str | None], float] = {}
 
 # Initialise the key store and model mapper.
 _key_store = _KeyStore(_keys_file)
@@ -554,6 +562,42 @@ def _response_from_upstream(resp: httpx.Response) -> Response:
     return Response(content=resp.content, status_code=resp.status_code, headers=headers)
 
 
+def _client_ip(request: Request) -> str:
+    """Return the direct TCP peer IP for unauthenticated public metadata audit."""
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown-ip"
+
+
+def _should_suppress_public_tags_log(
+    channel: str,
+    user_key: str,
+    method: str,
+    path: str,
+    route_class: str | None,
+    status: int | None = None,
+) -> bool:
+    """Rate-limit noisy public /api/tags log records per user/IP."""
+    if PUBLIC_TAGS_LOG_SUPPRESS_SECONDS <= 0:
+        return False
+    if route_class != "public_metadata" or method != "GET" or path != "/api/tags":
+        return False
+
+    now = time.time()
+    cache_key = (channel, user_key, method, path, str(status) if status is not None else None)
+    last = _PUBLIC_TAGS_LOG_LAST.get(cache_key)
+    if last is not None and now - last < PUBLIC_TAGS_LOG_SUPPRESS_SECONDS:
+        return True
+
+    _PUBLIC_TAGS_LOG_LAST[cache_key] = now
+    if len(_PUBLIC_TAGS_LOG_LAST) > 4096:
+        cutoff = now - PUBLIC_TAGS_LOG_SUPPRESS_SECONDS
+        for key, ts in list(_PUBLIC_TAGS_LOG_LAST.items()):
+            if ts < cutoff:
+                del _PUBLIC_TAGS_LOG_LAST[key]
+    return False
+
+
 def audit(user_key: str, method: str, path: str, model: str | None = None,
           status: int | None = None, tokens: dict | None = None, error: str | None = None,
           api_family: str | None = None, route_class: str | None = None):
@@ -566,6 +610,8 @@ def audit(user_key: str, method: str, path: str, model: str | None = None,
         if out:
             TOKENS_OUT.labels(user=user_key, model=model).inc(out)
     if not AUDIT_ENABLED:
+        return
+    if _should_suppress_public_tags_log("audit", user_key, method, path, route_class, status):
         return
     record = {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -1184,13 +1230,15 @@ async def ollama_api(request: Request, path: str, x_api_key: str | None = Header
     api_key = extract_api_key(x_api_key, authorization)
 
     if route_class == "public_metadata":
-        user = "anonymous"
+        public_user = _client_ip(request)
+        user = public_user
         request.state.user = user
         if api_key:
             try:
                 user = await validate_key_async(api_key, request)
             except HTTPException:
-                request.state.user = "anonymous"
+                user = public_user
+                request.state.user = user
     else:
         try:
             user = await validate_key_async(api_key, request)
@@ -1228,7 +1276,8 @@ async def ollama_api(request: Request, path: str, x_api_key: str | None = Header
     model = body_json.get("model") if isinstance(body_json.get("model"), str) else None
     headers = _ollama_headers(request)
 
-    log.info(f"[{user}] {request.method} {api_path} route_class={route_class} model={model or '-'}")
+    if not _should_suppress_public_tags_log("request", user, request.method, api_path, route_class):
+        log.info(f"[{user}] {request.method} {api_path} route_class={route_class} model={model or '-'}")
 
     try:
         if route_class == "model_egress" and _ollama_should_stream(api_path, body_json):

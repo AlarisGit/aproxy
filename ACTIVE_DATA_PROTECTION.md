@@ -1266,7 +1266,8 @@ Decisions made in the native Ollama allowlist increment:
 - Ollama non-Anthropic model routes are supported only through explicit allowlist:
   `/api/generate`, `/api/chat`, `/api/embed`;
 - `GET /api/tags` is a public metadata exception for native Ollama model pickers
-  such as Cline; unauthenticated requests are audited as `anonymous`;
+  such as Cline; unauthenticated requests are audited by client IP, with repeated
+  audit/proxy-log records suppressed by `public_tags_log_suppress_seconds`;
 - native Ollama metadata routes are allowlisted:
   `/api/ps`, `/api/version`, `/api/show`;
 - native Ollama admin/model-management routes are denied:
