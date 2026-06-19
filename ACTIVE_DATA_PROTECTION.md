@@ -447,6 +447,7 @@ HTTP route
 
 ```text
 POST /v1/messages      -> protected_model_egress
+POST /v1/messages/count_tokens -> local_token_estimate
 POST /api/generate     -> protected_model_egress
 POST /api/chat         -> protected_model_egress
 POST /api/embed        -> protected_model_egress

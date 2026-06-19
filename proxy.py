@@ -496,6 +496,20 @@ def _merge_ollama_native_usage_from_line(line: str, total_tokens: dict):
         total_tokens.update(tokens)
 
 
+def _estimate_count_tokens(body_json: dict) -> int:
+    """Return a conservative local estimate for Anthropic count_tokens."""
+    countable = {
+        key: body_json[key]
+        for key in ("system", "messages", "tools", "tool_choice")
+        if key in body_json
+    }
+    if not countable:
+        return 0
+
+    payload = json.dumps(countable, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return max(1, (len(payload) + 3) // 4)
+
+
 _OLLAMA_MODEL_ROUTES = {
     ("POST", "/api/generate"),
     ("POST", "/api/chat"),
@@ -799,7 +813,7 @@ async def add_cors_and_timing(request: Request, call_next):
 # Known path buckets for Prometheus labels (bounded cardinality)
 _KNOWN_PATHS = {
     "/v1/messages", "/v1/models", "/v1/organizations",
-    "/v1/messages/batches",
+    "/v1/messages/count_tokens", "/v1/messages/batches",
     "/api/generate", "/api/chat", "/api/embed", "/api/tags",
     "/api/ps", "/api/version", "/api/show",
 }
@@ -880,6 +894,36 @@ async def list_models(request: Request, x_api_key: str | None = Header(None), au
     except Exception as e:
         log.error(f"Ollama /v1/models error: {e}")
         return JSONResponse(status_code=502, content={"type": "error", "error": {"type": "api_error", "message": str(e)}})
+
+
+@app.post("/v1/messages/count_tokens")
+async def count_tokens(request: Request, x_api_key: str | None = Header(None),
+                       authorization: str | None = Header(None)):
+    """Anthropic-compatible local token count estimate for Claude clients."""
+    api_key = extract_api_key(x_api_key, authorization)
+    user = await validate_key_async(api_key, request)
+
+    body = await request.body()
+    try:
+        body_json = json.loads(body) if body else {}
+    except (json.JSONDecodeError, ValueError):
+        return make_error(400, "invalid_request_error", "Request body must be valid JSON.")
+    if not isinstance(body_json, dict):
+        return make_error(400, "invalid_request_error", "Request body must be a JSON object.")
+
+    requested_model = body_json.get("model", "unknown")
+    _model_mapper.reload_if_changed()
+    resolved_model, original_model = _model_mapper.resolve(requested_model, AVAILABLE_OLLAMA_MODELS)
+    if original_model:
+        log.info(f"[{user}] mapped Anthropic model {original_model} -> {resolved_model} for count_tokens")
+
+    input_tokens = _estimate_count_tokens(body_json)
+    log.info(
+        f"[{user}] POST /v1/messages/count_tokens model={resolved_model} "
+        f"(requested={requested_model}) input_tokens={input_tokens}"
+    )
+    audit(user, "POST", "/v1/messages/count_tokens", model=resolved_model, status=200)
+    return {"input_tokens": input_tokens}
 
 
 @app.post("/v1/messages")

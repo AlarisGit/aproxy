@@ -8,6 +8,68 @@ import respx
 import proxy
 
 
+class TestCountTokens:
+    def test_count_tokens_requires_auth(self, client):
+        response = client.post(
+            "/v1/messages/count_tokens",
+            json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+        assert response.status_code == 401
+        assert response.json()["error"]["type"] == "authentication_error"
+
+    @respx.mock
+    def test_count_tokens_returns_local_estimate_without_upstream_call(
+        self, client, auth_headers, monkeypatch
+    ):
+        audit_records = []
+        monkeypatch.setattr(proxy, "audit", lambda *args, **kwargs: audit_records.append((args, kwargs)))
+        upstream_route = respx.post("http://127.0.0.1:11434/v1/messages/count_tokens").respond(
+            500,
+            json={"error": {"message": "should not call upstream"}},
+        )
+
+        response = client.post(
+            "/v1/messages/count_tokens",
+            headers=auth_headers,
+            json={
+                "model": "test",
+                "system": "Be brief.",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+        assert response.status_code == 200
+        assert isinstance(response.json()["input_tokens"], int)
+        assert response.json()["input_tokens"] > 0
+        assert not upstream_route.called
+        assert len(audit_records) == 1
+        assert audit_records[0][0][:3] == ("tester", "POST", "/v1/messages/count_tokens")
+        assert audit_records[0][1]["model"] == "test"
+        assert audit_records[0][1]["status"] == 200
+        assert "tokens" not in audit_records[0][1]
+
+    def test_count_tokens_maps_anthropic_model_for_audit(self, client, auth_headers, monkeypatch):
+        audit_records = []
+        monkeypatch.setattr(proxy, "audit", lambda *args, **kwargs: audit_records.append((args, kwargs)))
+        monkeypatch.setattr(proxy, "AVAILABLE_OLLAMA_MODELS", {"glm-5.2:cloud"})
+        proxy._model_mapper.mapping = {"sonnet": "glm-5.2:cloud"}
+        proxy._model_mapper.default = ""
+
+        response = client.post(
+            "/v1/messages/count_tokens",
+            headers=auth_headers,
+            json={
+                "model": "claude-sonnet-4-5",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["input_tokens"] > 0
+        assert audit_records[0][1]["model"] == "glm-5.2:cloud"
+
+
 class TestMessagesNonStreaming:
     def test_messages_requires_auth(self, client):
         response = client.post("/v1/messages", json={"model": "test"})
