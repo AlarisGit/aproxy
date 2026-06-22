@@ -161,11 +161,14 @@ class _ModelMapper:
             log.info(f"Model mapping file changed (mtime {self._mtime} -> {current_mtime}), reloading")
             self._load()
 
-    def resolve(self, requested: str, available: set[str]) -> tuple[str, str | None]:
+    def resolve(self, requested: object, available: set[str]) -> tuple[str, str | None]:
         """Return (final_model, original_model).
 
         original_model is non-None only when a translation actually happened.
         """
+        if not isinstance(requested, str) or not requested:
+            return "unknown", None
+
         requested_lower = requested.lower()
         if not requested_lower.startswith("claude-"):
             return requested, None
@@ -412,6 +415,21 @@ def make_error(status_code: int, error_type: str, message: str) -> JSONResponse:
     )
 
 
+def make_openai_error(status_code: int, error_type: str, message: str) -> JSONResponse:
+    """Return OpenAI-compatible error response."""
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "message": message,
+                "type": error_type,
+                "param": None,
+                "code": None,
+            }
+        },
+    )
+
+
 def make_ollama_error(status_code: int, message: str) -> JSONResponse:
     """Return an Ollama-style JSON error response."""
     return JSONResponse(status_code=status_code, content={"error": message})
@@ -483,6 +501,22 @@ def _ollama_native_tokens(data: dict) -> dict | None:
     return tokens or None
 
 
+def _openai_usage_tokens(data: dict) -> dict | None:
+    """Convert OpenAI usage fields into aproxy token counters."""
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return None
+
+    tokens = {}
+    if isinstance(usage.get("prompt_tokens"), int):
+        tokens["input_tokens"] = usage["prompt_tokens"]
+    if isinstance(usage.get("completion_tokens"), int):
+        tokens["output_tokens"] = usage["completion_tokens"]
+    if isinstance(usage.get("total_tokens"), int):
+        tokens["total_tokens"] = usage["total_tokens"]
+    return tokens or None
+
+
 def _merge_ollama_native_usage_from_line(line: str, total_tokens: dict):
     """Extract native Ollama usage fields from one NDJSON line."""
     try:
@@ -492,6 +526,27 @@ def _merge_ollama_native_usage_from_line(line: str, total_tokens: dict):
     if not isinstance(data, dict):
         return
     tokens = _ollama_native_tokens(data)
+    if tokens:
+        total_tokens.update(tokens)
+
+
+def _merge_openai_stream_usage_from_line(line: str, total_tokens: dict):
+    """Extract OpenAI usage fields from one SSE data line."""
+    if not line.startswith("data:"):
+        return
+
+    payload = line[5:].strip()
+    if not payload or payload == "[DONE]":
+        return
+
+    try:
+        data = json.loads(payload)
+    except (json.JSONDecodeError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+
+    tokens = _openai_usage_tokens(data)
     if tokens:
         total_tokens.update(tokens)
 
@@ -565,6 +620,17 @@ def _ollama_headers(request: Request) -> dict:
         v = request.headers.get(h)
         if v:
             headers[h] = v
+    return headers
+
+
+def _openai_headers(request: Request) -> dict:
+    headers = {
+        "Authorization": "Bearer ollama",
+        "Content-Type": "application/json",
+    }
+    accept = request.headers.get("accept")
+    if accept:
+        headers["accept"] = accept
     return headers
 
 
@@ -728,6 +794,12 @@ async def add_cors_and_timing(request: Request, call_next):
         rejected, limit = _body_too_large(request)
         if rejected:
             log.warning(f"Request body too large or unbounded: {path} (limit={limit})")
+            if path == "/v1/chat/completions":
+                return make_openai_error(
+                    413,
+                    "request_too_large",
+                    f"Request body exceeds maximum allowed size of {limit} bytes.",
+                )
             return JSONResponse(
                 status_code=413,
                 content={
@@ -814,6 +886,7 @@ async def add_cors_and_timing(request: Request, call_next):
 _KNOWN_PATHS = {
     "/v1/messages", "/v1/models", "/v1/organizations",
     "/v1/messages/count_tokens", "/v1/messages/batches",
+    "/v1/chat/completions",
     "/api/generate", "/api/chat", "/api/embed", "/api/tags",
     "/api/ps", "/api/version", "/api/show",
 }
@@ -1101,6 +1174,230 @@ async def _stream_response(request: Request, http_client, user: str, model: str,
         request.state.stream_status = 500
         audit(user, "POST", "/v1/messages", model=model, status=500, error=str(e))
         return make_error(500, "api_error", f"Stream error: {e}")
+
+
+@app.post("/v1/chat/completions")
+async def openai_chat_completions(request: Request, x_api_key: str | None = Header(None),
+                                  authorization: str | None = Header(None)):
+    """OpenAI-compatible chat completions endpoint - proxied to Ollama."""
+    api_key = extract_api_key(x_api_key, authorization)
+    try:
+        user = await validate_key_async(api_key, request)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+        return make_openai_error(
+            exc.status_code,
+            detail.get("type", "authentication_error"),
+            detail.get("message", "Authentication failed"),
+        )
+
+    body = await request.body()
+    try:
+        body_json = json.loads(body) if body else {}
+    except (json.JSONDecodeError, ValueError):
+        return make_openai_error(400, "invalid_request_error", "Request body must be valid JSON.")
+    if not isinstance(body_json, dict):
+        return make_openai_error(400, "invalid_request_error", "Request body must be a JSON object.")
+
+    requested_model = body_json.get("model", "unknown")
+    stream = body_json.get("stream", False)
+
+    _model_mapper.reload_if_changed()
+    resolved_model, original_model = _model_mapper.resolve(requested_model, AVAILABLE_OLLAMA_MODELS)
+
+    if resolved_model != requested_model:
+        body_json["model"] = resolved_model
+        body = json.dumps(body_json).encode("utf-8")
+        if original_model:
+            log.info(f"[{user}] mapped OpenAI chat model {original_model} -> {resolved_model}")
+
+    model = resolved_model
+    headers = _openai_headers(request)
+
+    log.info(f"[{user}] POST /v1/chat/completions model={model} (requested={requested_model}) stream={stream}")
+
+    try:
+        if stream:
+            return await _openai_chat_completions_stream_response(
+                request, http_client=client, user=user, model=model, body=body, headers=headers,
+            )
+
+        resp = await client.post("/v1/chat/completions", content=body, headers=headers)
+
+        tokens = None
+        error_text = None
+        if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("application/json"):
+            try:
+                tokens = _openai_usage_tokens(resp.json())
+            except (json.JSONDecodeError, ValueError):
+                tokens = None
+        elif resp.status_code >= 400:
+            log.warning(f"[{user}] Ollama OpenAI chat error {resp.status_code}: {resp.text[:500]}")
+            error_text = resp.text[:200]
+
+        audit(
+            user,
+            "POST",
+            "/v1/chat/completions",
+            model=model,
+            status=resp.status_code,
+            tokens=tokens,
+            error=error_text,
+            api_family="openai",
+        )
+        return _response_from_upstream(resp)
+    except httpx.ReadTimeout:
+        log.error(f"[{user}] OpenAI chat completions timeout")
+        audit(
+            user,
+            "POST",
+            "/v1/chat/completions",
+            model=model,
+            status=504,
+            error="timeout",
+            api_family="openai",
+        )
+        return make_openai_error(504, "timeout_error", "Ollama request timed out")
+    except Exception as e:
+        log.error(f"[{user}] OpenAI chat completions proxy error: {e}", exc_info=True)
+        audit(
+            user,
+            "POST",
+            "/v1/chat/completions",
+            model=model,
+            status=500,
+            error=str(e),
+            api_family="openai",
+        )
+        return make_openai_error(500, "api_error", f"Proxy error: {e}")
+
+
+async def _openai_chat_completions_stream_response(
+    request: Request,
+    http_client,
+    user: str,
+    model: str,
+    body: bytes,
+    headers: dict,
+):
+    """Stream OpenAI-compatible chat completions SSE while extracting usage."""
+    request.state.stream_status = 500
+
+    try:
+        stream_cm = http_client.stream("POST", "/v1/chat/completions", content=body, headers=headers)
+        resp = await stream_cm.__aenter__()
+        request.state.stream_status = resp.status_code
+
+        if resp.status_code != 200:
+            try:
+                error_body = await resp.aread()
+            finally:
+                await stream_cm.__aexit__(None, None, None)
+            error_text = error_body.decode("utf-8", errors="replace")
+            audit(
+                user,
+                "POST",
+                "/v1/chat/completions",
+                model=model,
+                status=resp.status_code,
+                error=error_text[:200],
+                api_family="openai",
+            )
+            content_type = resp.headers.get("content-type", "application/json")
+            return Response(
+                content=error_body,
+                status_code=resp.status_code,
+                headers={"content-type": content_type},
+            )
+
+        total_tokens = {}
+
+        async def generate():
+            stream_broken = False
+            client_disconnected = False
+            yielded_any = False
+            try:
+                async for line in resp.aiter_lines():
+                    yielded_any = True
+                    yield line + "\n"
+                    _merge_openai_stream_usage_from_line(line, total_tokens)
+            except httpx.StreamClosed:
+                if yielded_any:
+                    client_disconnected = True
+                    log.info(f"[{user}] client disconnected during OpenAI chat stream")
+                else:
+                    stream_broken = True
+                    log.error(f"[{user}] Ollama closed OpenAI chat stream unexpectedly before any data")
+            except Exception as e:
+                if yielded_any:
+                    client_disconnected = True
+                    log.warning(f"[{user}] OpenAI chat stream error after partial data: {e}")
+                else:
+                    stream_broken = True
+                    log.error(f"[{user}] Error while streaming OpenAI chat completions: {e}")
+            finally:
+                status = 200 if not stream_broken else 500
+                request.state.stream_status = status
+                error_msg = None
+                if client_disconnected:
+                    error_msg = "client disconnected"
+                elif stream_broken:
+                    error_msg = "stream closed by Ollama"
+                audit(
+                    user,
+                    "POST",
+                    "/v1/chat/completions",
+                    model=model,
+                    status=status,
+                    tokens=total_tokens if total_tokens else None,
+                    error=error_msg,
+                    api_family="openai",
+                )
+                try:
+                    await stream_cm.__aexit__(None, None, None)
+                except Exception as e:
+                    log.warning(f"[{user}] error closing OpenAI chat stream: {e}")
+                if stream_broken:
+                    error_event = {
+                        "error": {
+                            "message": "Ollama closed the stream unexpectedly.",
+                            "type": "api_error",
+                            "param": None,
+                            "code": None,
+                        }
+                    }
+                    yield f"data: {json.dumps(error_event)}\n\n"
+
+        request.state.streaming_response = True
+        content_type = resp.headers.get("content-type", "text/event-stream")
+        return StreamingResponse(generate(), media_type=content_type)
+
+    except httpx.ReadTimeout:
+        log.error(f"[{user}] OpenAI chat completions stream timeout")
+        request.state.stream_status = 504
+        audit(
+            user,
+            "POST",
+            "/v1/chat/completions",
+            model=model,
+            status=504,
+            error="stream timeout",
+            api_family="openai",
+        )
+        return make_openai_error(504, "timeout_error", "Ollama stream timed out")
+    except Exception as e:
+        log.error(f"[{user}] OpenAI chat completions stream error: {e}", exc_info=True)
+        request.state.stream_status = 500
+        audit(
+            user,
+            "POST",
+            "/v1/chat/completions",
+            model=model,
+            status=500,
+            error=str(e),
+            api_family="openai",
+        )
+        return make_openai_error(500, "api_error", f"Stream error: {e}")
 
 
 async def _ollama_native_response(
